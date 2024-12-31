@@ -48,8 +48,6 @@ jobs:
         env:
           CIBW_BUILD: "cp${{ env.PYTHON_VERSION_SHORT }}-*"
           CIBW_BEFORE_BUILD: |
-            yum update -y &&
-            yum groupinstall -y "Development Tools" &&
             curl https://sh.rustup.rs -sSf | sh -s -- -y &&
             export PATH=$HOME/.cargo/bin:$PATH &&
             pip install maturin
