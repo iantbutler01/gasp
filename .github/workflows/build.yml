@@ -11,8 +11,10 @@ on:
 ##########################################
 jobs:
   build-ubuntu:
-    name: Build on Ubuntu
+    name: Build on manylinux2014
     runs-on: ubuntu-latest
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
     strategy:
       matrix:
         python-version: ["3.8.16", "3.9.16", "3.10.12", "3.11.6", "3.12.0"]
@@ -32,7 +34,6 @@ jobs:
           - python-version: "3.12.0"
             architecture: "arm64"
       fail-fast: false
-
     steps:
       - name: Check out code
         uses: actions/checkout@v3
@@ -55,7 +56,7 @@ jobs:
           override: true
 
       - name: Build Wheels
-        run: maturin build --release
+        run: maturin build --release --manylinux 2_28
 
       - name: Upload Wheels
         uses: actions/upload-artifact@v3
