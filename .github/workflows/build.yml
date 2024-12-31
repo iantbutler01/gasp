@@ -14,17 +14,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        arch: [x86_64, aarch64]
+        platform: [linux, darwin]
+        arch: [x86, x64, arm64]
         python-version:
-          ["3.7.16", "3.8.16", "3.9.16", "3.10.16", "3.11.11", "3.12.8"]
+          ["3.7.16", "3.8.16", "3.9.16", "3.10.12", "3.11.6", "3.12.0"]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Install Rosetta for macOS ARM64 (if needed)
-        if: matrix.os == 'macos-latest' && matrix.arch == 'aarch64' && contains('3.8.16 3.9.16', matrix.python-version)
+        if: matrix.platform == 'darwin' && matrix.arch == 'arm64' && contains('3.8.16 3.9.16', matrix.python-version)
         run: |
           softwareupdate --install-rosetta --agree-to-license
 
@@ -32,7 +32,7 @@ jobs:
         id: arch
         run: |
           ARCH=${{ matrix.arch }}
-          if [[ "${{ matrix.os }}" == "macos-latest" && "${{ matrix.arch }}" == "aarch64" && "${{ matrix.python-version }}" =~ ^(3.8.16|3.9.16)$ ]]; then
+          if [[ "${{ matrix.platform }}" == "darwin" && "${{ matrix.arch }}" == "arm64" && "${{ matrix.python-version }}" =~ ^(3.8.16|3.9.16)$ ]]; then
             ARCH=x64
           fi
           echo "arch=$ARCH" >> $GITHUB_ENV
@@ -56,16 +56,16 @@ jobs:
           override: true
 
       - name: Install Rust target for ARM (if necessary)
-        if: matrix.os == 'ubuntu-latest' && matrix.arch == 'aarch64'
+        if: matrix.platform == 'linux' && matrix.arch == 'arm64'
         run: rustup target add aarch64-unknown-linux-gnu
 
       - name: Build Wheels
         run: |
-          if [[ "${{ matrix.os }}" == "ubuntu-latest" && "${{ matrix.arch }}" == "aarch64" ]]; then
+          if [[ "${{ matrix.platform }}" == "linux" && "${{ matrix.arch }}" == "arm64" ]]; then
             maturin build --release --manylinux 2_28 --target aarch64-unknown-linux-gnu
-          elif [[ "${{ matrix.os }}" == "ubuntu-latest" && "${{ matrix.arch }}" == "x86_64" ]]; then
+          elif [[ "${{ matrix.platform }}" == "linux" && "${{ matrix.arch }}" == "x64" ]]; then
             maturin build --release --manylinux 2_28
-          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+          elif [[ "${{ matrix.platform }}" == "darwin" ]]; then
             maturin build --release
           fi
 
