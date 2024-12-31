@@ -30,7 +30,7 @@ jobs:
           architecture: ${{ matrix.architecture }}
 
       - name: Inject short Python version
-        run: echo "PYTHON_VERSION_SHORT=${{ matrix.python-version }}" | sed 's/\.//g' >> $GITHUB_ENV
+        run: echo "PYTHON_VERSION_SHORT=${{ matrix.python-version }}" | sed -E 's/\.([0-9]+)$//' | sed 's/\.//g' >> $GITHUB_ENV
 
       - name: Install dependencies
         run: |
