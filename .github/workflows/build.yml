@@ -43,7 +43,11 @@ jobs:
       - name: Build wheels
         run: cibuildwheel --output-dir dist/
         env:
-          CIBW_BEFORE_BUILD: "pip install maturin && maturin build --release --strip"
+          CIBW_BEFORE_BUILD: |
+            apt-get update && apt-get install -y curl build-essential
+            && curl https://sh.rustup.rs -sSf | sh -s -- -y
+            && export PATH=$HOME/.cargo/bin:$PATH
+            && pip install maturin
           CIBW_SKIP: "pp*"
 
       - name: Upload Wheels
