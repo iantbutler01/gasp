@@ -17,15 +17,33 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         arch: [x86_64, aarch64]
         python-version: ["3.7", "3.8", "3.9", "3.10", "3.11", "3.12"]
+        exclude:
+          - os: macos-latest
+            arch: aarch64
+            python-version: "3.7" # Python 3.7 is not supported on macOS ARM64
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      - name: Determine Python architecture
+        id: arch
+        run: |
+          if [[ "${{ matrix.os }}" == "macos-latest" && "${{ matrix.arch }}" == "aarch64" && "${{ matrix.python-version }}" =~ ^(3.8|3.9)$ ]]; then
+            echo "arch=x64" >> $GITHUB_ENV
+          else
+            echo "arch=${{ matrix.arch }}" >> $GITHUB_ENV
+
+      - name: Install Rosetta for macOS ARM64 (if needed)
+        if: matrix.os == 'macos-latest' && matrix.arch == 'aarch64' && contains('3.8 3.9', matrix.python-version)
+        run: |
+          softwareupdate --install-rosetta --agree-to-license
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
+          architecture: ${{ env.arch }}
 
       - name: Install dependencies
         run: |
