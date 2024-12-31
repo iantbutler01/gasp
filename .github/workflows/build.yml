@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install Rosetta for macOS ARM64 (if needed)
-        if: matrix.platform == 'darwin' && matrix.arch == 'arm64' && contains('3.8.16 3.9.16', matrix.python-version)
+        if: matrix.platform == 'darwin' && matrix.arch == 'arm64' && contains('3.8.16 3.9.16 3.10.12', matrix.python-version)
         run: |
           softwareupdate --install-rosetta --agree-to-license
 
@@ -33,7 +33,7 @@ jobs:
         id: arch
         run: |
           ARCH=${{ matrix.arch }}
-          if [[ "${{ matrix.platform }}" == "darwin" && "${{ matrix.arch }}" == "arm64" && "${{ matrix.python-version }}" =~ ^(3.8.16|3.9.16)$ ]]; then
+          if [[ "${{ matrix.platform }}" == "darwin" && "${{ matrix.arch }}" == "arm64" && "${{ matrix.python-version }}" =~ ^(3.8.16|3.9.16|3.10.12)$ ]]; then
             ARCH=x64
           fi
           echo "arch=$ARCH" >> $GITHUB_ENV
