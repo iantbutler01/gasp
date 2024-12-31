@@ -11,35 +11,20 @@ on:
 ##########################################
 jobs:
   build-ubuntu:
-    name: Build on manylinux2014
+    name: Build on Ubuntu
     runs-on: ubuntu-latest
-    container:
-      image: quay.io/pypa/manylinux_2_28_x86_64
     strategy:
       matrix:
         python-version: ["3.8.16", "3.9.16", "3.10.12", "3.11.6", "3.12.0"]
-        architecture: ["x64", "arm64"]
-        exclude:
-          # Drop ARM for older Python versions on Ubuntu
-          - python-version: "3.8.16"
-            architecture: "arm64"
-          - python-version: "3.9.16"
-            architecture: "arm64"
-          - python-version: "3.10.12"
-            architecture: "arm64"
-
-          # Drop ARM for 3.11 and 3.12 on Ubuntu (from your original excludes)
-          - python-version: "3.11.6"
-            architecture: "arm64"
-          - python-version: "3.12.0"
-            architecture: "arm64"
+        architecture: ["x64"]
       fail-fast: false
+
     steps:
       - name: Check out code
         uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
@@ -47,7 +32,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m ensurepip
-          python -m pip install --upgrade pip maturin twine
+          python -m pip install --upgrade pip maturin twine cibuildwheel==2.22.0
 
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
@@ -55,8 +40,11 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Build Wheels
-        run: maturin build --release --manylinux 2_28
+      - name: Build wheels
+        run: cibuildwheel --output-dir dist/
+        env:
+          CIBW_BEFORE_BUILD: "maturin build --release --no-sdist --strip"
+          CIBW_SKIP: "pp*"
 
       - name: Upload Wheels
         uses: actions/upload-artifact@v3
