@@ -46,13 +46,13 @@ jobs:
       - name: Build wheels
         run: cibuildwheel --output-dir dist/
         env:
+          CIBW_SKIP: "pp* musllinux* *-win32 *-ppc64le *-s390x"
           CIBW_BUILD: "cp${{ env.PYTHON_VERSION_SHORT }}-*"
           CIBW_BEFORE_BUILD: |
             curl https://sh.rustup.rs -sSf | sh -s -- -y &&
             export PATH=$HOME/.cargo/bin:$PATH &&
             pip install maturin
           CIBW_ENVIRONMENT: PATH=$HOME/.cargo/bin:$PATH
-          CIBW_SKIP: "pp*"
 
       - name: Upload Wheels
         uses: actions/upload-artifact@v3
