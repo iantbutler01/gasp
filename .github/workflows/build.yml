@@ -29,6 +29,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
 
+      - name: Inject short Python version
+        run: echo "PYTHON_VERSION_SHORT=${{ matrix.python-version }}" | sed 's/\.//g' >> $GITHUB_ENV
+
       - name: Install dependencies
         run: |
           python -m ensurepip
@@ -43,6 +46,7 @@ jobs:
       - name: Build wheels
         run: cibuildwheel --output-dir dist/
         env:
+          CIBW_BUILD: "cp${{ env.PYTHON_VERSION_SHORT }}-*"
           CIBW_BEFORE_BUILD: |
             yum update -y &&
             yum groupinstall -y "Development Tools" &&
