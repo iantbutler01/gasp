@@ -43,7 +43,7 @@ jobs:
       - name: Build wheels
         run: cibuildwheel --output-dir dist/
         env:
-          CIBW_BEFORE_BUILD: "pip install maturin && maturin build --release --no-sdist --strip"
+          CIBW_BEFORE_BUILD: "pip install maturin && maturin build --release --strip"
           CIBW_SKIP: "pp*"
 
       - name: Upload Wheels
