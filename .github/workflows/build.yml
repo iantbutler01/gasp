@@ -39,6 +39,10 @@ jobs:
           brew install gettext
           brew link --force gettext
 
+      - name: Set library path (macOS only)
+        if: runner.os == 'macOS'
+        run: echo "DYLD_LIBRARY_PATH=$(brew --prefix gettext)/lib" >> $GITHUB_ENV
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
