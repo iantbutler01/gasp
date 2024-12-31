@@ -7,19 +7,34 @@ on:
     branches: [release]
 
 jobs:
-  #######################################################################
-  # 1) Ubuntu builds (if you still need them; they’re optional, actually)
-  #######################################################################
-  build-ubuntu:
-    name: Build on ubuntu-latest
-    runs-on: ubuntu-latest
+  build:
+    name: Build Wheels
+    runs-on: ${{ matrix.platform }}
+
     strategy:
       matrix:
+        platform: [ubuntu-latest, macos-latest]
         python-version: ["3.8.16", "3.9.16", "3.10.12", "3.11.6", "3.12.0"]
         architecture: ["x64", "arm64"]
+        exclude:
+          # Drop ARM for older Python versions
+          - python-version: "3.8.16"
+            architecture: "arm64"
+          - python-version: "3.9.16"
+            architecture: "arm64"
+          - python-version: "3.10.12"
+            architecture: "arm64"
+      fail-fast: false
+
     steps:
-      - name: Checkout
+      - name: Check out code
         uses: actions/checkout@v3
+
+      - name: Install missing dependencies (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          brew install gettext
+          echo "DYLD_LIBRARY_PATH=$(brew --prefix gettext)/lib" >> $GITHUB_ENV
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -44,123 +59,18 @@ jobs:
       - name: Upload Wheels
         uses: actions/upload-artifact@v3
         with:
-          name: wheels-ubuntu
+          name: built-wheels
           path: target/wheels/*.whl
 
-  #######################################################################
-  # 2) macOS builds for Python < 3.11, using an Intel-based runner (macos-11)
-  #######################################################################
-  build-pre-311:
-    name: Build macOS (Intel) for Python < 3.11
-    runs-on: macos-11 # <--- Pinned to macos-11 (Intel-based)
-    strategy:
-      matrix:
-        python-version: ["3.8.16", "3.9.16", "3.10.12"]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Install dependencies (Homebrew)
-        run: |
-          brew install gettext
-          echo "DYLD_LIBRARY_PATH=$(brew --prefix gettext)/lib" >> $GITHUB_ENV
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: ${{ matrix.python-version }}
-          architecture: x64 # Specifically x64 on Intel mac
-          # so you don't get the architecture mismatch
-
-      - name: Install Py deps
-        run: |
-          python -m ensurepip
-          python -m pip install --upgrade pip maturin twine
-
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-
-      - name: Build Wheels
-        run: maturin build --release
-
-      - name: Upload Wheels
-        uses: actions/upload-artifact@v3
-        with:
-          name: wheels-macos-pre311
-          path: target/wheels/*.whl
-
-  #########################################################################
-  # 3) macOS builds for Python >= 3.11, using the latest runner (macos-latest)
-  #########################################################################
-  build-311plus:
-    name: Build macOS (Apple Silicon) for Python >= 3.11
-    runs-on: macos-latest # <--- "Latest" runner is often Apple Silicon now
-    strategy:
-      matrix:
-        python-version: ["3.11.6", "3.12.0"]
-        architecture: ["arm64"] # You can do x64, but arm64 is typical on Apple Silicon
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Install dependencies (Homebrew)
-        run: |
-          brew install gettext
-          echo "DYLD_LIBRARY_PATH=$(brew --prefix gettext)/lib" >> $GITHUB_ENV
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: ${{ matrix.python-version }}
-          architecture: ${{ matrix.architecture }}
-
-      - name: Install Py deps
-        run: |
-          python -m ensurepip
-          python -m pip install --upgrade pip maturin twine
-
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-
-      - name: Build Wheels
-        run: maturin build --release
-
-      - name: Upload Wheels
-        uses: actions/upload-artifact@v3
-        with:
-          name: wheels-macos-311plus
-          path: target/wheels/*.whl
-
-  ################################################################
-  # 4) Combine or publish wheels (just an example "publish" job)
-  ################################################################
   publish:
     name: Publish to PyPI
     runs-on: ubuntu-latest
-    needs: [build-ubuntu, build-pre-311, build-311plus]
+    needs: build
     steps:
-      - name: Download Ubuntu wheels
+      - name: Download built wheels
         uses: actions/download-artifact@v3
         with:
-          name: wheels-ubuntu
-          path: wheels
-
-      - name: Download macOS pre-3.11 wheels
-        uses: actions/download-artifact@v3
-        with:
-          name: wheels-macos-pre311
-          path: wheels
-
-      - name: Download macOS 3.11+ wheels
-        uses: actions/download-artifact@v3
-        with:
-          name: wheels-macos-311plus
+          name: built-wheels
           path: wheels
 
       - name: Publish to PyPI
