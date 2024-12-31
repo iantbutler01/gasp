@@ -16,40 +16,38 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         arch: [x86_64, aarch64]
-        python-version: ["3.7", "3.8", "3.9", "3.10", "3.11", "3.12"]
-        exclude:
-          - os: macos-latest
-            arch: aarch64
-            python-version: "3.7" # Python 3.7 is not supported on macOS ARM64
+        python-version:
+          ["3.7.16", "3.8.16", "3.9.16", "3.10.16", "3.11.11", "3.12.8"]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+
+      - name: Install Rosetta for macOS ARM64 (if needed)
+        if: matrix.os == 'macos-latest' && matrix.arch == 'aarch64' && contains('3.8.16 3.9.16', matrix.python-version)
+        run: |
+          softwareupdate --install-rosetta --agree-to-license
+
       - name: Determine Python architecture
         id: arch
         run: |
-          if [[ "${{ matrix.os }}" == "macos-latest" && "${{ matrix.arch }}" == "aarch64" && "${{ matrix.python-version }}" =~ ^(3.8|3.9)$ ]]; then
-            echo "arch=x64" >> $GITHUB_ENV
-          else
-            echo "arch=${{ matrix.arch }}" >> $GITHUB_ENV
+          ARCH=${{ matrix.arch }}
+          if [[ "${{ matrix.os }}" == "macos-latest" && "${{ matrix.arch }}" == "aarch64" && "${{ matrix.python-version }}" =~ ^(3.8.16|3.9.16)$ ]]; then
+            ARCH=x64
           fi
-      - name: Install Rosetta for macOS ARM64 (if needed)
-        if: matrix.os == 'macos-latest' && matrix.arch == 'aarch64' && contains('3.8 3.9', matrix.python-version)
-        run: |
-          softwareupdate --install-rosetta --agree-to-license
+          echo "arch=$ARCH" >> $GITHUB_ENV
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          cache: false
           python-version: ${{ matrix.python-version }}
           architecture: ${{ env.arch }}
+          cache: false
 
       - name: Install dependencies
         run: |
           python -m ensurepip
-          python -m pip install --upgrade pip
-          python -m pip install maturin twine
+          python -m pip install --upgrade pip maturin twine
 
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
