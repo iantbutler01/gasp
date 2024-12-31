@@ -2,11 +2,9 @@ name: Build, Test, and Publish Wheels
 
 on:
   push:
-    branches:
-      - release
+    branches: [release]
   pull_request:
-    branches:
-      - release
+    branches: [release]
 
 jobs:
   build:
@@ -17,31 +15,27 @@ jobs:
         platform: [ubuntu-latest, macos-latest]
         python-version: ["3.8.16", "3.9.16", "3.10.12", "3.11.6", "3.12.0"]
         architecture: ["x64", "arm64"]
-
         exclude:
+          # Exclude arm64 for Python < 3.11 on macOS
           - platform: macos-latest
             python-version: "3.8.16"
-            architecture: arm64
+            architecture: "arm64"
           - platform: macos-latest
             python-version: "3.9.16"
-            architecture: arm64
+            architecture: "arm64"
           - platform: macos-latest
             python-version: "3.10.12"
-            architecture: arm64
+            architecture: "arm64"
 
     steps:
-      - name: Checkout code
+      - name: Check out code
         uses: actions/checkout@v3
 
       - name: Install missing dependencies (macOS only)
         if: runner.os == 'macOS'
         run: |
           brew install gettext
-          brew link --force gettext
-
-      - name: Set library path (macOS only)
-        if: runner.os == 'macOS'
-        run: echo "DYLD_LIBRARY_PATH=$(brew --prefix gettext)/lib" >> $GITHUB_ENV
+          echo "DYLD_LIBRARY_PATH=$(brew --prefix gettext)/lib" >> $GITHUB_ENV
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -61,8 +55,7 @@ jobs:
           override: true
 
       - name: Build Wheels
-        run: |
-          maturin build --release
+        run: maturin build --release
 
       - name: Upload Wheels
         uses: actions/upload-artifact@v3
