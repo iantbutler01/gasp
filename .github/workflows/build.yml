@@ -11,43 +11,33 @@ on:
 jobs:
   build:
     name: Build Wheels
+    runs-on: ${{ matrix.platform }}
     strategy:
       matrix:
-        platform: [linux, darwin]
-        arch: [x86, x64, arm64]
-        python-version:
-          ["3.7.16", "3.8.16", "3.9.16", "3.10.12", "3.11.6", "3.12.0"]
-        exclude:
-          - platform: darwin
-            arch: arm64
-            python-version: "3.7.16" # Exclude Python 3.7 for macOS ARM64
+        platform: [ubuntu-latest, macos-latest]
+        python-version: ["3.8.16", "3.9.16", "3.10.12", "3.11.6", "3.12.0"]
+        architecture: ["x64", "arm64"]
 
-    runs-on: ${{ matrix.platform == 'linux' && 'ubuntu-latest' || matrix.platform == 'darwin' && 'macos-latest' }}
+    exclude:
+      - platform: macos-latest
+        python-version: "3.8.16"
+        architecture: arm64
+      - platform: macos-latest
+        python-version: "3.9.16"
+        architecture: arm64
+      - platform: macos-latest
+        python-version: "3.10.12"
+        architecture: arm64
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install Rosetta for macOS ARM64 (if needed)
-        if: matrix.platform == 'darwin' && matrix.arch == 'arm64' && contains('3.8.16 3.9.16 3.10.12', matrix.python-version)
-        run: |
-          softwareupdate --install-rosetta --agree-to-license
-
-      - name: Determine Python architecture
-        id: arch
-        run: |
-          ARCH=${{ matrix.arch }}
-          if [[ "${{ matrix.platform }}" == "darwin" && "${{ matrix.arch }}" == "arm64" && "${{ matrix.python-version }}" =~ ^(3.8.16|3.9.16|3.10.12)$ ]]; then
-            ARCH=x64
-          fi
-          echo "arch=$ARCH" >> $GITHUB_ENV
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
-          architecture: ${{ env.arch }}
-          cache: false
+          architecture: ${{ matrix.architecture }}
 
       - name: Install dependencies
         run: |
@@ -60,19 +50,9 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Install Rust target for ARM (if necessary)
-        if: matrix.platform == 'linux' && matrix.arch == 'arm64'
-        run: rustup target add aarch64-unknown-linux-gnu
-
       - name: Build Wheels
         run: |
-          if [[ "${{ matrix.platform }}" == "linux" && "${{ matrix.arch }}" == "arm64" ]]; then
-            maturin build --release --manylinux 2_28 --target aarch64-unknown-linux-gnu
-          elif [[ "${{ matrix.platform }}" == "linux" && "${{ matrix.arch }}" == "x64" ]]; then
-            maturin build --release --manylinux 2_28
-          elif [[ "${{ matrix.platform }}" == "darwin" ]]; then
-            maturin build --release
-          fi
+          maturin build --release
 
       - name: Upload Wheels
         uses: actions/upload-artifact@v3
