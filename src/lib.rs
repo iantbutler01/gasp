@@ -68,9 +68,62 @@ impl WAILGenerator {
 
     /// Load WAIL schema content
     #[pyo3(text_signature = "($self, content)")]
-    fn load_wail(&mut self, content: String) -> PyResult<()> {
+    fn load_wail(&mut self, content: String) -> PyResult<Option<Py<PyDict>>> {
+        use pyo3::types::PyDict;
+        use pyo3::Python;
+
         self.wail_content = content;
-        Ok(())
+
+        let parser = wail_parser::WAILParser::new();
+        let res = parser.parse_wail_file(&self.wail_content);
+
+        match res {
+            Ok(_) => Ok(None),
+            Err(e) => Python::with_gil(|py| {
+                let py_dict = PyDict::new(py);
+                match e {
+                    wail_parser::WAILParseError::UnexpectedToken { found, location } => {
+                        py_dict.set_item("error_type", "UnexpectedToken")?;
+                        py_dict.set_item("found", found)?;
+                        py_dict.set_item("location", format!("{:?}", location))?;
+                    }
+                    wail_parser::WAILParseError::UnexpectedEOF { expected, location } => {
+                        py_dict.set_item("error_type", "UnexpectedEOF")?;
+                        py_dict.set_item("expected", expected)?;
+                        py_dict.set_item("location", format!("{:?}", location))?;
+                    }
+                    wail_parser::WAILParseError::InvalidIdentifier { found, location } => {
+                        py_dict.set_item("error_type", "InvalidIdentifier")?;
+                        py_dict.set_item("found", found)?;
+                        py_dict.set_item("location", format!("{:?}", location))?;
+                    }
+                    wail_parser::WAILParseError::UndefinedType { name, location } => {
+                        py_dict.set_item("error_type", "UndefinedType")?;
+                        py_dict.set_item("name", name)?;
+                        py_dict.set_item("location", format!("{:?}", location))?;
+                    }
+                    wail_parser::WAILParseError::DuplicateDefinition { name, location } => {
+                        py_dict.set_item("error_type", "DuplicateDefinition")?;
+                        py_dict.set_item("name", name)?;
+                        py_dict.set_item("location", format!("{:?}", location))?;
+                    }
+                    wail_parser::WAILParseError::MissingMainBlock => {
+                        py_dict.set_item("error_type", "MissingMainBlock")?;
+                    }
+                    wail_parser::WAILParseError::InvalidTemplateCall {
+                        template_name,
+                        reason,
+                        location,
+                    } => {
+                        py_dict.set_item("error_type", "InvalidTemplateCall")?;
+                        py_dict.set_item("template_name", template_name)?;
+                        py_dict.set_item("reason", reason)?;
+                        py_dict.set_item("location", format!("{:?}", location))?;
+                    }
+                }
+                Ok(Some(py_dict.into()))
+            }),
+        }
     }
 
     #[pyo3(text_signature = "($self, **kwargs)", signature = (**kwargs))]
