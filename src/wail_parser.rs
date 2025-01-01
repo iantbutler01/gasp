@@ -2,17 +2,79 @@ use crate::json_types::{JsonError, JsonValue, Number};
 use crate::parser_types::*;
 use crate::rd_json_stack_parser::Parser as JsonParser;
 use crate::types::*;
+use nom::error::ParseError;
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_until, take_while1},
     character::complete::{alpha1, char, multispace0, multispace1},
     combinator::opt,
-    multi::{many0, separated_list0},
+    multi::{many0, many1, separated_list0},
     sequence::{delimited, preceded, tuple},
-    IResult,
+    Err, IResult,
 };
+
+use nom_supreme::final_parser::Location;
+use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+
+use nom_supreme::error::{BaseErrorKind, ErrorTree, Expectation, StackContext};
+use nom_supreme::parser_ext::ParserExt;
+
+fn error_location(e: nom::Err<ErrorTree<&str>>, original_input: &str) -> Location {
+    let location = match e {
+        nom::Err::Error(ErrorTree::Base { location, .. }) => location,
+        nom::Err::Failure(ErrorTree::Base { location, .. }) => location,
+        _ => "unknown",
+    };
+
+    if location == "unknown" {
+        return Location { line: 0, column: 0 };
+    }
+
+    Location::locate_tail(original_input, location)
+}
+
+#[derive(Debug, Clone)]
+pub enum WAILParseError {
+    // Syntax errors
+    UnexpectedToken {
+        found: String,
+        location: Location,
+    },
+    UnexpectedEOF {
+        expected: String,
+        location: Location,
+    },
+    InvalidIdentifier {
+        found: String,
+        location: Location,
+    },
+
+    // Static analysis errors
+    UndefinedType {
+        name: String,
+        location: Location,
+    },
+    DuplicateDefinition {
+        name: String,
+        location: Location,
+    },
+    MissingMainBlock,
+    InvalidTemplateCall {
+        template_name: String,
+        reason: String,
+        location: Location,
+    },
+}
+
+// Helper function to get line and column from input
+fn get_position(full_input: &str, current_pos: usize) -> (usize, usize) {
+    let preceding = &full_input[..current_pos];
+    let line = preceding.chars().filter(|&c| c == '\n').count() + 1;
+    let column = preceding.chars().rev().take_while(|&c| c != '\n').count() + 1;
+    (line, column)
+}
 
 fn count_leading_whitespace(line: &str) -> usize {
     line.chars().take_while(|c| c.is_whitespace()).count()
@@ -173,12 +235,9 @@ impl<'a> WAILParser<'a> {
             ));
         }
 
-        println!("{:?}", segments);
-
         // Try to parse each segment and build the map
         let mut result = HashMap::new();
         for (var_name, segment) in var_names.into_iter().zip(segments) {
-            println!("{}", segment);
             let mut parser = JsonParser::new(segment.as_bytes().to_vec());
             let json_value = parser
                 .parse()
@@ -201,43 +260,128 @@ impl<'a> WAILParser<'a> {
             .unwrap()
     }
 
-    pub fn parse_wail_file(&'a self, input: &'a str) -> IResult<&'a str, Vec<WAILDefinition<'a>>> {
+    pub fn parse_wail_file(
+        &'a self,
+        input: &'a str,
+    ) -> Result<Vec<WAILDefinition<'a>>, WAILParseError> {
         self.registry.borrow_mut().clear();
         self.template_registry.borrow_mut().clear();
         self.main.borrow_mut().take();
 
-        let (input, _) = multispace0(input)?;
-        let (input, mut definitions) = separated_list0(
-            multispace1,
-            alt((
-                |input| self.parse_definition(input),
-                |input| self.parse_comment(input),
-            )),
-        )(input)?;
-        let (input, _) = multispace0(input)?;
+        let original_input = input;
+
+        let (input, _) = multispace0(input).map_err(|e: nom::Err<ErrorTree<&'a str>>| {
+            WAILParseError::UnexpectedToken {
+                found: "invalid whitespace".to_string(),
+                location: error_location(e, original_input),
+            }
+        })?;
+
+        let mut definitions: Vec<WAILDefinition<'a>> = vec![];
+
+        let mut input = input;
+
+        loop {
+            let (new_input, _) =
+                multispace0(input).map_err(|e: nom::Err<ErrorTree<&'a str>>| {
+                    WAILParseError::UnexpectedEOF {
+                        expected: "Continuation of definition or comment".to_string(),
+                        location: error_location(e, original_input),
+                    }
+                })?;
+
+            input = new_input;
+
+            if input.is_empty() {
+                break;
+            }
+
+            let (new_input, definition) = if input.starts_with("#") {
+                self.parse_comment(input)
+                    .map_err(|e| WAILParseError::UnexpectedToken {
+                        found: e.to_string(),
+                        location: error_location(e, original_input),
+                    })?
+            } else if input.starts_with("object")
+                || input.starts_with("template")
+                || input.starts_with("union")
+            {
+                self.parse_definition(input).map_err(|e| match e {
+                    nom::Err::Failure(ErrorTree::Base {
+                        location: _,
+                        kind: BaseErrorKind::Kind(nom::error::ErrorKind::Verify),
+                    }) => WAILParseError::DuplicateDefinition {
+                        name: input
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        location: error_location(e, original_input),
+                    },
+                    nom::Err::Error(ErrorTree::Base { location, .. }) => {
+                        WAILParseError::UnexpectedToken {
+                            found: location.lines().next().unwrap_or("unknown").to_string(),
+                            location: error_location(e, original_input),
+                        }
+                    }
+                    e => {
+                        println!("{:?}", e);
+                        WAILParseError::UnexpectedEOF {
+                            expected: "Unexpected Error".to_string(),
+                            location: error_location(e, original_input),
+                        }
+                    }
+                })?
+            } else {
+                break;
+            };
+
+            input = new_input;
+
+            definitions.push(definition);
+        }
+
+        if input.len() < 4 || &input[0..4] != "main" {
+            return Err(WAILParseError::MissingMainBlock);
+        }
 
         // Parse required main block at the end
-        if let Ok((remaining, main_def)) = self.parse_main(input) {
-            definitions.push(WAILDefinition::Main(main_def));
-            Ok((remaining, definitions))
-        } else {
-            Ok((input, definitions))
+        match self.parse_main(input) {
+            Ok((_, main_def)) => {
+                definitions.push(WAILDefinition::Main(main_def));
+                Ok(definitions)
+            }
+            Err(_) => Err(WAILParseError::MissingMainBlock),
         }
     }
 
-    fn parse_comment(&'a self, input: &'a str) -> IResult<&'a str, WAILDefinition<'a>> {
+    fn parse_comment(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, WAILDefinition<'a>, ErrorTree<&'a str>> {
         let (input, _) = tuple((multispace0, tag("#"), multispace0, take_until("\n")))(input)?;
         Ok((input, WAILDefinition::Comment(input.to_string())))
     }
 
-    fn parse_object(&'a self, input: &'a str) -> IResult<&'a str, WAILDefinition<'a>> {
+    fn parse_object(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, WAILDefinition<'a>, ErrorTree<&'a str>> {
         // Parse: Object Name { ... }
         let (input, _) = tuple((tag("object"), multispace1))(input)?;
         let (input, name) = self.identifier(input)?;
+
+        if self.registry.borrow().contains_key(name) {
+            return Err(nom::Err::Failure(ErrorTree::from_error_kind(
+                input,
+                nom::error::ErrorKind::Verify, // Using Verify since this is a validation error
+            )));
+        }
+
         let (input, _) = multispace0(input)?;
         let (input, fields) = delimited(
             char('{'),
-            many0(delimited(multispace0, |i| self.parse_field(i), multispace0)),
+            many1(delimited(multispace0, |i| self.parse_field(i), multispace0)),
             char('}'),
         )(input)?;
 
@@ -285,7 +429,7 @@ impl<'a> WAILParser<'a> {
         Ok((input, definition))
     }
 
-    fn parse_field(&'a self, input: &'a str) -> IResult<&str, WAILField> {
+    fn parse_field(&'a self, input: &'a str) -> IResult<&str, WAILField, ErrorTree<&'a str>> {
         let (input, (name, _, _, (field_type, _))) = tuple((
             |i| self.identifier(i),
             char(':'),
@@ -309,7 +453,7 @@ impl<'a> WAILParser<'a> {
         &'a self,
         input: &'a str,
         complex_type_name: Option<&'a str>,
-    ) -> IResult<&str, (WAILType<'a>, String)> {
+    ) -> IResult<&str, (WAILType<'a>, String), ErrorTree<&'a str>> {
         // Parse first type identifier
         let (input, base_type) = self.identifier(input)?;
         let (input, _) = multispace0(input)?;
@@ -375,7 +519,7 @@ impl<'a> WAILParser<'a> {
         &'a self,
         type_name: &'a str,
         is_array: bool,
-    ) -> Result<WAILType<'a>, nom::Err<nom::error::Error<&str>>> {
+    ) -> Result<WAILType<'a>, nom::Err<ErrorTree<&'a str>>> {
         let inner_type = match type_name {
             "String" => WAILType::Simple(WAILSimpleType::String(WAILString {
                 value: String::new(),
@@ -450,16 +594,26 @@ impl<'a> WAILParser<'a> {
         }
     }
 
-    fn identifier(&'a self, input: &'a str) -> IResult<&'a str, &'a str> {
+    fn identifier(&'a self, input: &'a str) -> IResult<&'a str, &'a str, ErrorTree<&'a str>> {
         take_while1(|c: char| c.is_alphanumeric() || c == '_')(input)
     }
 
-    fn parse_template(&'a self, input: &'a str) -> IResult<&'a str, WAILDefinition<'a>> {
+    fn parse_template(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, WAILDefinition<'a>, ErrorTree<&'a str>> {
         // Parse: template Name(param: Type) -> ReturnType { prompt: """ ... """ }
         let (input, _) = tuple((tag("template"), multispace1))(input)?;
 
         // Parse template name
         let (input, name) = self.identifier(input)?;
+
+        if self.template_registry.borrow().contains_key(name) {
+            return Err(nom::Err::Failure(ErrorTree::from_error_kind(
+                input,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
 
         let (input, _) = multispace0(input)?;
 
@@ -515,7 +669,10 @@ impl<'a> WAILParser<'a> {
         Ok((input, WAILDefinition::Template(template_def)))
     }
 
-    fn parse_template_call(&'a self, input: &'a str) -> IResult<&'a str, WAILTemplateCall> {
+    fn parse_template_call(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, WAILTemplateCall, ErrorTree<&'a str>> {
         let (input, template_name) = self.identifier(input)?;
         let (input, _) = tuple((multispace0, char('('), multispace0))(input)?;
 
@@ -540,27 +697,42 @@ impl<'a> WAILParser<'a> {
         ))
     }
 
-    fn parse_string_literal(&'a self, input: &'a str) -> IResult<&'a str, TemplateArgument> {
+    fn parse_string_literal(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, TemplateArgument, ErrorTree<&'a str>> {
         let (input, _) = char('"')(input)?;
         let (input, content) = take_until("\"")(input)?;
         let (input, _) = char('"')(input)?;
         Ok((input, TemplateArgument::String(content.to_string())))
     }
 
-    fn parse_number(&'a self, input: &'a str) -> IResult<&'a str, TemplateArgument> {
+    fn parse_number(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, TemplateArgument, ErrorTree<&'a str>> {
         let (input, num_str) = take_while1(|c: char| c.is_ascii_digit())(input)?;
         let num = num_str.parse::<i64>().map_err(|_| {
-            nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Digit))
+            nom::Err::Error(ErrorTree::from_error_kind(
+                input,
+                nom::error::ErrorKind::Digit,
+            ))
         })?;
         Ok((input, TemplateArgument::Number(num)))
     }
 
-    fn parse_type_ref(&'a self, input: &'a str) -> IResult<&'a str, TemplateArgument> {
+    fn parse_type_ref(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, TemplateArgument, ErrorTree<&'a str>> {
         let (input, type_name) = self.identifier(input)?;
         Ok((input, TemplateArgument::TypeRef(type_name.to_string())))
     }
 
-    fn parse_value(&'a self, input: &'a str) -> IResult<&'a str, TemplateArgument> {
+    fn parse_value(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, TemplateArgument, ErrorTree<&'a str>> {
         alt((
             |i| self.parse_string_literal(i),
             |i| self.parse_number(i),
@@ -568,7 +740,10 @@ impl<'a> WAILParser<'a> {
         ))(input)
     }
 
-    fn parse_argument(&'a self, input: &'a str) -> IResult<&'a str, (String, TemplateArgument)> {
+    fn parse_argument(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, (String, TemplateArgument), ErrorTree<&'a str>> {
         let (input, name) = self.identifier(input)?;
         let (input, _) = tuple((multispace0, char(':'), multispace0))(input)?;
 
@@ -587,11 +762,14 @@ impl<'a> WAILParser<'a> {
         Ok((input, (name.to_string(), value)))
     }
 
-    fn parse_main(&'a self, input: &'a str) -> IResult<&'a str, WAILMainDef<'a>> {
+    fn parse_main(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, WAILMainDef<'a>, ErrorTree<&'a str>> {
         if self.main.borrow().is_some() {
-            return Err(nom::Err::Error(nom::error::Error::new(
+            return Err(nom::Err::Error(ErrorTree::from_error_kind(
                 input,
-                nom::error::ErrorKind::Alt,
+                nom::error::ErrorKind::Verify,
             )));
         }
 
@@ -694,7 +872,10 @@ impl<'a> WAILParser<'a> {
         Ok((input, main))
     }
 
-    fn parse_template_arg(&'a self, input: &'a str) -> IResult<&'a str, (String, WAILType<'a>)> {
+    fn parse_template_arg(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, (String, WAILType<'a>), ErrorTree<&'a str>> {
         let (input, name) = self.identifier(input)?;
         let (input, _) = tuple((multispace0, char(':'), multispace0))(input)?;
         let (input, (arg_type, _)) = self.parse_type(input, None)?;
@@ -702,7 +883,10 @@ impl<'a> WAILParser<'a> {
         Ok((input, (name.to_string(), arg_type)))
     }
 
-    fn parse_annotation(&'a self, input: &'a str) -> IResult<&'a str, WAILAnnotation> {
+    fn parse_annotation(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, WAILAnnotation, ErrorTree<&'a str>> {
         let (input, _) = tuple((char('@'), tag("description"), char('('), char('"')))(input)?;
         let (input, desc) = take_until("\"")(input)?;
         let (input, _) = char('"')(input)?;
@@ -712,7 +896,10 @@ impl<'a> WAILParser<'a> {
         Ok((input, WAILAnnotation::Description(desc.to_string())))
     }
 
-    fn parse_parameter(&'a self, input: &'a str) -> IResult<&'a str, WAILField> {
+    fn parse_parameter(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, WAILField, ErrorTree<&'a str>> {
         let (input, (name, _, _, (param_type, _))) = tuple((
             |i| self.identifier(i),
             char(':'),
@@ -730,12 +917,18 @@ impl<'a> WAILParser<'a> {
         ))
     }
 
-    fn parse_definition(&'a self, input: &'a str) -> IResult<&'a str, WAILDefinition<'a>> {
-        let (input, res) = alt((
-            |i| self.parse_object(i),
-            |i| self.parse_template(i),
-            |i| self.parse_union(i),
-        ))(input)?;
+    fn parse_definition(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, WAILDefinition<'a>, ErrorTree<&'a str>> {
+        let (_, tag) = alt((tag("object"), tag("template"), tag("union")))(input)?;
+
+        let (input, res) = match tag {
+            "object" => self.parse_object(input),
+            "template" => self.parse_template(input),
+            "union" => self.parse_union(input),
+            _ => unreachable!(),
+        }?;
 
         Ok((input, res))
     }
@@ -790,10 +983,21 @@ impl<'a> WAILParser<'a> {
         (warnings, errors)
     }
 
-    fn parse_union(&'a self, input: &'a str) -> IResult<&'a str, WAILDefinition<'a>> {
+    fn parse_union(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, WAILDefinition<'a>, ErrorTree<&'a str>> {
         // Parse: union Name = Type1 | Type2 | Type3
         let (input, _) = tuple((tag("union"), multispace1))(input)?;
         let (input, name) = self.identifier(input)?;
+
+        if self.registry.borrow().contains_key(name) {
+            return Err(nom::Err::Failure(ErrorTree::from_error_kind(
+                input,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
+
         let (input, _) = tuple((multispace0, char('='), multispace0))(input)?;
 
         let (input, (union, _)) = self.parse_type(input, Some(name))?;
@@ -932,6 +1136,17 @@ pub enum WAILDefinition<'a> {
     Union(WAILField<'a>),
     Main(WAILMainDef<'a>),
     Comment(String),
+}
+
+impl<'a> WAILDefinition<'a> {
+    fn get_name(&self) -> Option<&str> {
+        match self {
+            WAILDefinition::Object(field) => Some(&field.name),
+            WAILDefinition::Template(template) => Some(&template.name),
+            WAILDefinition::Union(field) => Some(&field.name),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1275,11 +1490,7 @@ Return in this format: {{return_type}}"#
         }
         "#;
 
-        let (remaining, definitions) = parser.parse_wail_file(input).unwrap();
-        assert!(
-            remaining.trim().is_empty(),
-            "Parser should consume all input"
-        );
+        let definitions = parser.parse_wail_file(input).unwrap();
         assert_eq!(
             definitions.len(),
             3,
@@ -1672,5 +1883,65 @@ Return in this format: {{return_type}}"#
 
         let result = parser.validate_json(&res.unwrap().to_string());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_wail_errors() {
+        let parser = WAILParser::new();
+
+        // Test duplicate object definition
+        let input = r#"
+        object Person {
+            name: String
+        }
+        object Person {
+            age: Number
+        }
+        main {
+            prompt { }
+        }
+        "#;
+
+        let err = parser.parse_wail_file(input).unwrap_err();
+        assert!(
+            matches!(err, WAILParseError::DuplicateDefinition { name, .. } if name == "Person")
+        );
+
+        // Test missing main block
+        let input = r#"
+        object Person {
+            name: String
+        }
+        "#;
+
+        let err = parser.parse_wail_file(input).unwrap_err();
+        assert!(matches!(err, WAILParseError::MissingMainBlock));
+
+        // Test unexpected token
+        let input = r#"
+        object Person {
+            name: String
+            age: @ Number
+        }
+        main {
+            prompt { }
+        }
+        "#;
+
+        let err = parser.parse_wail_file(input).unwrap_err();
+
+        assert!(
+            matches!(err, WAILParseError::UnexpectedToken { found, .. } if found == "age: @ Number")
+        );
+
+        //     // Test EOF
+        //     let input = r#"
+        //     object Person {
+        //         name: String
+        // "#;
+
+        //     let err = parser.parse_wail_file(input).unwrap_err();
+        //     println!("{:?}", err);
+        //     assert!(matches!(err, WAILParseError::UnexpectedEOF { .. }));
     }
 }
