@@ -34,7 +34,7 @@ Anyway both Asimov and now GASP/WAIL are built for supporting [Bismuth](https://
 - **LLM-Optimized**: Specifically designed to work with the quirks and inconsistencies of LLM outputs
 
 ## Anti-Features
-- **Non existant syntax error messages** - I will get around to this soon but right now this is just as likely to segfault or die in rust with a cryptic error message as it is to tell you what you're doing is wrong.
+- **Limited syntax error messages** - Right now syntax errors will tell you where the parser failed but messages aren't more helpful than that so sometimes it's hard to figure out what is wrong in the parser syntax.
 
 ## Caveats
 - **Output parsing is assumed to be sequential** - That is we assume output happens in the same order as the template variable binding so like if binding1 doesn't correspond to output1 things will be wacky.
@@ -81,14 +81,20 @@ generator = WAILGenerator(r'''
 # Get the prompt to send to the LLM
 (prompt, warnings, errors) = generator.get_prompt()
 
-# Parse and validate JSON responses
-generator.parse_llm_output("""
+# Use your favorite LLM client to send the prompt and get a response
+response = your_fav_client.generate(prompt) # or whatever your interface is
+examples_res = """
+<result>
 {
     name: "Alice",
     "age": 25,
     "interests": [coding, 'AI', "music"]
 }
-""")
+</result>
+"""
+
+# Parse and validate JSON responses
+generator.parse_llm_output(response)
 
 # Note the ability to handle malformed JSON
 ```
@@ -177,6 +183,7 @@ def main():
     # In a real application, you would send this prompt to your LLM
     # Here we'll simulate an LLM response with some typical quirks
     llm_response = """
+    <result>
     {
         'name': 'Alice',
         'age': 25,
@@ -186,6 +193,7 @@ def main():
             hiking,
         ]
     }
+    </result>
     """
 
     try:

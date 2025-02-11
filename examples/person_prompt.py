@@ -66,6 +66,7 @@ def main():
     # In a real application, you would send this prompt to your LLM
     # Here we'll simulate an LLM response with some typical quirks
     llm_response = """
+    <result>
     {
         name: 'Alice',
         'age': 25,
@@ -75,6 +76,7 @@ def main():
             hiking,
         ]
     }
+    </result>
     """
 
     try:
