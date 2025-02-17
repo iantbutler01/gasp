@@ -15,8 +15,10 @@ use nom::{
 
 use nom_supreme::final_parser::Location;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env::var;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use nom_supreme::error::{BaseErrorKind, ErrorTree};
 
@@ -65,7 +67,37 @@ pub enum WAILParseError {
         reason: String,
         location: Location,
     },
+    CircularImport {
+        path: String,
+        chain: Vec<String>,
+    },
+    InvalidImportPath {
+        path: String,
+        error: String,
+    },
+    FileError {
+        path: String,
+        error: String,
+    },
+    ImportNotFound {
+        name: String,
+        path: String,
+    },
 }
+
+impl std::fmt::Display for WAILParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WAILParseError::CircularImport { path, chain } => {
+                write!(f, "Circular import detected: {} in chain {:?}", path, chain)
+            }
+            // ... handle other variants ...
+            _ => write!(f, "{:?}", self),
+        }
+    }
+}
+
+impl std::error::Error for WAILParseError {}
 
 fn count_leading_whitespace(line: &str) -> usize {
     line.chars().take_while(|c| c.is_whitespace()).count()
@@ -112,10 +144,323 @@ pub struct WAILParser<'a> {
     main: RefCell<Option<WAILMainDef<'a>>>,
     // Track object instantiations with their variable names
     object_instances: RefCell<HashMap<String, WAILObjectInstantiation>>,
+    import_chain: RefCell<ImportChain>,
+    base_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct ImportChain {
+    // Track the chain of imports to detect cycles
+    chain: Vec<String>,
+    // Current working directory for resolving relative paths
+    base_path: PathBuf,
+}
+
+impl ImportChain {
+    fn new(base_path: PathBuf) -> Self {
+        Self {
+            chain: Vec::new(),
+            base_path,
+        }
+    }
+
+    fn push(&mut self, path: &str) -> Result<(), WAILParseError> {
+        let canonical_path = self.resolve_path(path)?;
+
+        if self.chain.contains(&canonical_path) {
+            return Err(WAILParseError::CircularImport {
+                path: canonical_path,
+                chain: self.chain.clone(),
+            });
+        }
+
+        self.chain.push(canonical_path);
+        Ok(())
+    }
+
+    fn pop(&mut self) {
+        self.chain.pop();
+    }
+
+    fn resolve_path(&self, path: &str) -> Result<String, WAILParseError> {
+        let path = PathBuf::from(path);
+
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            self.base_path.join(path)
+        };
+
+        // Clean up the path without checking file existence
+        let cleaned = resolved
+            .components()
+            .fold(PathBuf::new(), |mut cleaned, component| {
+                match component {
+                    std::path::Component::ParentDir => {
+                        cleaned.pop(); // Remove last component for ..
+                    }
+                    std::path::Component::Normal(part) => {
+                        cleaned.push(part);
+                    }
+                    std::path::Component::RootDir => {
+                        cleaned.push("/");
+                    }
+                    _ => {} // Skip . and prefix components
+                }
+                cleaned
+            });
+
+        Ok(cleaned.to_string_lossy().to_string())
+    }
+}
+
+#[derive(Debug)]
+pub enum WAILFileType {
+    Library,     // .lib.wail - only definitions allowed
+    Application, // .wail - requires main block
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WAILImport {
+    pub items: Vec<String>,
+    pub path: String,
 }
 
 impl<'a> WAILParser<'a> {
-    pub fn new() -> Self {
+    fn detect_file_type(path: &'a str) -> WAILFileType {
+        if path.ends_with(".lib.wail") {
+            WAILFileType::Library
+        } else {
+            WAILFileType::Application
+        }
+    }
+
+    fn collect_referenced_objects(
+        &self,
+        field_type: &WAILType<'a>,
+        objects: &HashMap<String, WAILDefinition<'a>>,
+        collected_defs: &mut Vec<WAILDefinition<'a>>,
+    ) {
+        match field_type {
+            WAILType::Composite(composite) => match composite {
+                WAILCompositeType::Object(obj) => {
+                    // Check if this object type exists in our objects map
+                    if let Some(def) = objects.get(obj.type_data.type_name) {
+                        if !collected_defs.contains(def) {
+                            collected_defs.push(def.clone());
+
+                            // Recursively check fields of this object
+                            if let Some(fields) = &obj.type_data.field_definitions {
+                                for field in fields {
+                                    self.collect_referenced_objects(
+                                        &field.field_type,
+                                        objects,
+                                        collected_defs,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                WAILCompositeType::Array(array) => {
+                    // Check element type if it exists
+                    if let Some(element_type) = &array.type_data.element_type {
+                        self.collect_referenced_objects(element_type, objects, collected_defs);
+                    }
+                }
+                WAILCompositeType::Union(union) => {
+                    // Check all union members
+                    for member in &union.members {
+                        self.collect_referenced_objects(
+                            &member.field_type,
+                            objects,
+                            collected_defs,
+                        );
+                    }
+                }
+            },
+            _ => (), // Simple types don't reference other objects
+        }
+    }
+
+    fn resolve_imports(
+        &'a self,
+        definitions: &Vec<WAILDefinition<'a>>,
+    ) -> Result<(), WAILParseError> {
+        let mut all_imported_defs = vec![];
+
+        for def in definitions {
+            if let WAILDefinition::Import(import) = def {
+                // Clean up import pollution since we use the same parser
+                self.object_instances.borrow_mut().clear();
+                self.registry.borrow_mut().clear();
+                self.template_registry.borrow_mut().clear();
+                // Load and parse the library file
+                let file_path = self.import_chain.borrow().resolve_path(&import.path)?;
+
+                let lib_content =
+                    std::fs::read_to_string(&file_path).map_err(|e| WAILParseError::FileError {
+                        path: import.path.clone(),
+                        error: e.to_string(),
+                    })?;
+
+                let file_type = WAILFileType::Library;
+
+                // Parse the library file
+                let lib_defs = self.parse_wail_file(lib_content, file_type, false)?;
+                let mut objects: HashMap<String, WAILDefinition> = HashMap::new();
+
+                for lib_def in &lib_defs {
+                    match lib_def {
+                        WAILDefinition::Object(field) => {
+                            objects.insert(field.name.clone(), lib_def.clone());
+                        }
+                        _ => continue,
+                    }
+                }
+
+                // Extract requested definitions
+                for item_name in &import.items {
+                    let mut found = false;
+                    for lib_def in &lib_defs {
+                        match lib_def {
+                            WAILDefinition::Object(field) if &field.name == item_name => {
+                                found = true;
+                                all_imported_defs.push(lib_def.clone());
+
+                                // Collect referenced objects
+                                self.collect_referenced_objects(
+                                    &field.field_type,
+                                    &objects,
+                                    &mut all_imported_defs,
+                                );
+                                break;
+                            }
+                            WAILDefinition::Template(template) if &template.name == item_name => {
+                                found = true;
+                                all_imported_defs.push(lib_def.clone());
+
+                                // Check input parameters
+                                for param in &template.inputs {
+                                    self.collect_referenced_objects(
+                                        &param.field_type,
+                                        &objects,
+                                        &mut all_imported_defs,
+                                    );
+                                }
+
+                                // Check return type
+                                self.collect_referenced_objects(
+                                    &template.output.field_type,
+                                    &objects,
+                                    &mut all_imported_defs,
+                                );
+                                break;
+                            }
+                            WAILDefinition::Union(field) if &field.name == item_name => {
+                                found = true;
+                                all_imported_defs.push(lib_def.clone());
+
+                                // Process union members and their referenced types
+                                self.collect_referenced_objects(
+                                    &field.field_type,
+                                    &objects,
+                                    &mut all_imported_defs,
+                                );
+                                break;
+                            }
+                            _ => continue,
+                        }
+                    }
+                    if !found {
+                        return Err(WAILParseError::ImportNotFound {
+                            name: item_name.clone(),
+                            path: import.path.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // One final clean up of import pollution since we use the same parser
+        self.object_instances.borrow_mut().clear();
+        self.registry.borrow_mut().clear();
+        self.template_registry.borrow_mut().clear();
+
+        // Finally insert defs that were selected
+        // This has to happen in two parts so we accumulate all defs first otherwise clearing would clobber.
+        for def in all_imported_defs {
+            match def {
+                WAILDefinition::Object(field) => {
+                    self.registry
+                        .borrow_mut()
+                        .insert(field.name.clone(), field.clone());
+                }
+                WAILDefinition::Template(template) => {
+                    self.template_registry
+                        .borrow_mut()
+                        .insert(template.name.clone(), template.clone());
+                }
+                WAILDefinition::Union(field) => {
+                    self.registry
+                        .borrow_mut()
+                        .insert(field.name.clone(), field.clone());
+                }
+                _ => continue,
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_import(
+        &'a self,
+        input: &'a str,
+    ) -> IResult<&'a str, WAILDefinition<'a>, ErrorTree<&'a str>> {
+        let (input, _) = tuple((tag("import"), multispace1))(input)?;
+
+        let (input, items) = delimited(
+            tuple((char('{'), multispace0)),
+            separated_list0(tuple((multispace0, char(','), multispace0)), |f| {
+                self.identifier(f)
+            }),
+            tuple((multispace0, char('}'))),
+        )(input)?;
+
+        let (input, _) = tuple((multispace0, tag("from"), multispace0))(input)?;
+        let (input, path) = delimited(char('"'), take_until("\""), char('"'))(input)?;
+
+        if let Err(e) = self.import_chain.borrow_mut().push(path) {
+            match e {
+                WAILParseError::CircularImport { path, chain } => {
+                    // Propagate circular import error directly
+                    return Err(nom::Err::Failure(ErrorTree::Stack {
+                        base: Box::new(ErrorTree::Base {
+                            location: input,
+                            kind: BaseErrorKind::External(Box::new(
+                                WAILParseError::CircularImport { path, chain },
+                            )),
+                        }),
+                        contexts: vec![],
+                    }));
+                }
+                _ => {
+                    return Err(nom::Err::Failure(ErrorTree::from_error_kind(
+                        input,
+                        nom::error::ErrorKind::Verify,
+                    )));
+                }
+            }
+        }
+
+        Ok((
+            input,
+            WAILDefinition::Import(WAILImport {
+                items: items.iter().map(|s| s.to_string()).collect(),
+                path: path.to_string(),
+            }),
+        ))
+    }
+
+    pub fn new(base_path: PathBuf) -> Self {
         Self {
             registry: RefCell::new(HashMap::new()),
             template_registry: RefCell::new(HashMap::new()),
@@ -124,6 +469,8 @@ impl<'a> WAILParser<'a> {
             adhoc_obj_ids: RefCell::new(Vec::new()),
             main: RefCell::new(None),
             object_instances: RefCell::new(HashMap::new()),
+            import_chain: RefCell::new(ImportChain::new(base_path.clone())),
+            base_path: base_path.clone(),
         }
     }
 
@@ -262,11 +609,17 @@ impl<'a> WAILParser<'a> {
 
     pub fn parse_wail_file(
         &'a self,
-        input: &'a str,
+        input_string: String,
+        file_type: WAILFileType,
+        clear: bool,
     ) -> Result<Vec<WAILDefinition<'a>>, WAILParseError> {
-        self.registry.borrow_mut().clear();
-        self.template_registry.borrow_mut().clear();
-        self.main.borrow_mut().take();
+        let input: &str = Box::leak(Box::new(input_string)); // Yes I hate that I leak this, no I'm not redesigning things for the lifetimes to line up
+
+        if clear {
+            self.registry.borrow_mut().clear();
+            self.template_registry.borrow_mut().clear();
+            self.main.borrow_mut().take();
+        }
 
         let original_input = input;
 
@@ -280,6 +633,64 @@ impl<'a> WAILParser<'a> {
         let mut definitions: Vec<WAILDefinition<'a>> = vec![];
 
         let mut input = input;
+
+        while !input.is_empty() && input.starts_with("import") {
+            let (new_input, import) = self.parse_import(input).map_err(|e| {
+                let emsg = e.to_string();
+                match e {
+                    nom::Err::Failure(ErrorTree::Stack { ref base, .. }) => {
+                        if let ErrorTree::Base {
+                            kind: BaseErrorKind::External(ref err),
+                            ..
+                        } = **base
+                        {
+                            if let Some(circular_err) = err.downcast_ref::<WAILParseError>() {
+                                match circular_err {
+                                    WAILParseError::CircularImport { path, chain } => {
+                                        WAILParseError::CircularImport {
+                                            path: path.clone(),
+                                            chain: chain.clone(),
+                                        }
+                                    }
+                                    _ => WAILParseError::UnexpectedToken {
+                                        found: emsg.to_string(),
+                                        location: error_location(e, original_input),
+                                    },
+                                }
+                            } else {
+                                WAILParseError::UnexpectedToken {
+                                    found: e.to_string(),
+                                    location: error_location(e, original_input),
+                                }
+                            }
+                        } else {
+                            WAILParseError::UnexpectedToken {
+                                found: e.to_string(),
+                                location: error_location(e, original_input),
+                            }
+                        }
+                    }
+                    _ => WAILParseError::UnexpectedToken {
+                        found: e.to_string(),
+                        location: error_location(e, original_input),
+                    },
+                }
+            })?;
+
+            input = new_input;
+            definitions.push(import);
+
+            let (new_input, _) =
+                multispace0(input).map_err(|e: nom::Err<ErrorTree<&'a str>>| {
+                    WAILParseError::UnexpectedToken {
+                        found: "invalid whitespace".to_string(),
+                        location: error_location(e, original_input),
+                    }
+                })?;
+            input = new_input;
+        }
+
+        self.resolve_imports(&definitions)?;
 
         loop {
             let (new_input, _) =
@@ -324,13 +735,10 @@ impl<'a> WAILParser<'a> {
                             location: error_location(e, original_input),
                         }
                     }
-                    e => {
-                        println!("{:?}", e);
-                        WAILParseError::UnexpectedEOF {
-                            expected: "Unexpected Error".to_string(),
-                            location: error_location(e, original_input),
-                        }
-                    }
+                    e => WAILParseError::UnexpectedEOF {
+                        expected: "Unexpected Error".to_string(),
+                        location: error_location(e, original_input),
+                    },
                 })?
             } else {
                 break;
@@ -341,45 +749,48 @@ impl<'a> WAILParser<'a> {
             definitions.push(definition);
         }
 
-        if input.len() < 4 || &input[0..4] != "main" {
-            return Err(WAILParseError::MissingMainBlock);
-        }
-        // Parse required main block at the end
+        match file_type {
+            WAILFileType::Library => Ok(definitions),
+            WAILFileType::Application => {
+                if input.len() < 4 || &input[0..4] != "main" {
+                    return Err(WAILParseError::MissingMainBlock);
+                }
 
-        match self.parse_main(input) {
-            Ok((_, main_def)) => {
-                definitions.push(WAILDefinition::Main(main_def));
-                Ok(definitions)
-            }
-            Err(e) => {
-                let err = match e {
-                    nom::Err::Failure(ErrorTree::Base {
-                        location: _,
-                        kind: BaseErrorKind::Kind(nom::error::ErrorKind::Verify),
-                    }) => WAILParseError::DuplicateDefinition {
-                        name: input
-                            .split_whitespace()
-                            .nth(1)
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        location: error_location(e, original_input),
-                    },
-                    nom::Err::Error(ErrorTree::Base { location, .. }) => {
-                        WAILParseError::UnexpectedToken {
-                            found: location.lines().next().unwrap_or("unknown").to_string(),
-                            location: error_location(e, original_input),
-                        }
-                    }
-                    e => {
-                        println!("{:?}", e);
-                        WAILParseError::UnexpectedEOF {
-                            expected: "Unexpected Error".to_string(),
-                            location: error_location(e, original_input),
-                        }
-                    }
-                };
+                // Parse required main block at the end
+                match self.parse_main(input) {
+                    Ok((_, main_def)) => {
+                        definitions.push(WAILDefinition::Main(main_def));
 
-                Err(err)
+                        Ok(definitions)
+                    }
+                    Err(e) => {
+                        let err = match e {
+                            nom::Err::Failure(ErrorTree::Base {
+                                location: _,
+                                kind: BaseErrorKind::Kind(nom::error::ErrorKind::Verify),
+                            }) => WAILParseError::DuplicateDefinition {
+                                name: input
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .unwrap_or("unknown")
+                                    .to_string(),
+                                location: error_location(e, original_input),
+                            },
+                            nom::Err::Error(ErrorTree::Base { location, .. }) => {
+                                WAILParseError::UnexpectedToken {
+                                    found: location.lines().next().unwrap_or("unknown").to_string(),
+                                    location: error_location(e, original_input),
+                                }
+                            }
+                            e => WAILParseError::UnexpectedEOF {
+                                expected: "Unexpected Error".to_string(),
+                                location: error_location(e, original_input),
+                            },
+                        };
+
+                        Err(err)
+                    }
+                }
             }
         }
     }
@@ -408,7 +819,7 @@ impl<'a> WAILParser<'a> {
         }
 
         let (input, _) = multispace0(input)?;
-        let (input, fields) = delimited(
+        let (input, mut fields) = delimited(
             char('{'),
             many1(delimited(multispace0, |i| self.parse_field(i), multispace0)),
             char('}'),
@@ -430,6 +841,41 @@ impl<'a> WAILParser<'a> {
                 field.field_type.clone(),
             );
         }
+
+        field_map.insert(
+            WAILString {
+                value: "_type".to_string(),
+                type_data: WAILTypeData {
+                    json_type: JsonValue::String("_type".to_string()),
+                    type_name: "String",
+                    field_definitions: None,
+                    element_type: None,
+                },
+            },
+            WAILType::Simple(WAILSimpleType::String(WAILString {
+                value: name.to_string(),
+                type_data: WAILTypeData {
+                    json_type: JsonValue::String("_type".to_string()),
+                    type_name: "String",
+                    field_definitions: None,
+                    element_type: None,
+                },
+            })),
+        );
+
+        fields.push(WAILField {
+            name: "_type".to_string(),
+            field_type: WAILType::Simple(WAILSimpleType::String(WAILString {
+                value: name.to_string(),
+                type_data: WAILTypeData {
+                    json_type: JsonValue::String("_type".to_string()),
+                    type_name: "String",
+                    field_definitions: None,
+                    element_type: None,
+                },
+            })),
+            annotations: vec![],
+        });
 
         let (input, annotations) = many0(|i| self.parse_annotation(i))(input)?;
 
@@ -474,7 +920,7 @@ impl<'a> WAILParser<'a> {
             WAILField {
                 name: name.to_string(),
                 field_type,
-                annotations: annotations, // For now, we'll add annotation parsing later
+                annotations: annotations,
             },
         ))
     }
@@ -591,8 +1037,29 @@ impl<'a> WAILParser<'a> {
                 members.push(member_type);
             }
 
+            let mut wail_fields = vec![];
+
+            let reg_borrow = self.registry.borrow();
+
+            for type_data in members.iter() {
+                let field_opt = reg_borrow.get(type_data.type_name());
+
+                match field_opt {
+                    Some(field) => wail_fields.push(field.clone()),
+                    None => {
+                        let field = WAILField {
+                            name: type_data.type_name().to_string(),
+                            field_type: type_data.clone(),
+                            annotations: vec![],
+                        };
+
+                        wail_fields.push(field)
+                    }
+                }
+            }
+
             WAILType::Composite(WAILCompositeType::Union(WAILUnion {
-                members,
+                members: wail_fields,
                 type_data: WAILTypeData {
                     json_type: JsonValue::Object(HashMap::new()),
                     type_name: &complex_type_name.unwrap_or("Union"),
@@ -916,7 +1383,6 @@ impl<'a> WAILParser<'a> {
         let (input, template_args) = opt(|input| {
             let (input, _) =
                 tuple((tag("template_args"), multispace0, char('{'), multispace0))(input)?;
-            // println!("{:?}", input);
             let (input, args) =
                 separated_list0(tuple((multispace0, char(','), multispace0)), |i| {
                     self.parse_template_arg(i)
@@ -1127,15 +1593,281 @@ impl<'a> WAILParser<'a> {
         Ok((input, res))
     }
 
-    pub fn validate_json(&self, json: &str) -> Result<(), String> {
+    pub fn get_error_location(&self, error: &JsonValidationError) -> Vec<PathSegment> {
+        match error {
+            JsonValidationError::ObjectMissingMetaType => {
+                vec![PathSegment::MissingMetaType]
+            }
+            JsonValidationError::ObjectNestedTypeValidation((field, nested_error)) => {
+                let mut path = vec![PathSegment::Field(field.clone())];
+                path.extend(self.get_error_location(nested_error));
+                path
+            }
+            JsonValidationError::ArrayElementTypeError((index, nested_error)) => {
+                let mut path = vec![PathSegment::ArrayIndex(*index)];
+                path.extend(self.get_error_location(nested_error));
+                path
+            }
+            JsonValidationError::NotMemberOfUnion((field, validation_errors)) => {
+                vec![PathSegment::UnionType(
+                    field.clone(),
+                    validation_errors.clone(),
+                )]
+            }
+            JsonValidationError::ObjectMissingRequiredField(field) => {
+                vec![PathSegment::Field(field.clone())]
+            }
+            JsonValidationError::ExpectedTypeError((field, expected_type)) => {
+                vec![PathSegment::ExpectedType(
+                    field.clone(),
+                    expected_type.clone(),
+                )]
+            }
+            _ => vec![],
+        }
+    }
+
+    fn infer_type_from_fields(&self, fields: &HashMap<String, JsonValue>) -> Option<String> {
+        let mut matches: Vec<String> = vec![];
+
+        let reg_borrow = self.registry.borrow();
+
+        for (name, field) in reg_borrow.clone().into_iter() {
+            match field.field_type.field_definitions() {
+                Some(obj_fields) => {
+                    let fieldset: HashSet<String> =
+                        obj_fields.iter().map(|field| field.name.clone()).collect();
+
+                    let original_set: HashSet<String> = fields.keys().cloned().collect();
+
+                    let diff = original_set.difference(&fieldset);
+                    let diff_vec: Vec<String> = diff.cloned().collect();
+
+                    if (diff_vec.len() == 1 && diff_vec.first().unwrap() == "_type")
+                        || diff_vec.len() == 0
+                    {
+                        matches.push(name.clone())
+                    }
+                }
+                None => continue,
+            }
+        }
+
+        if matches.len() > 1 || matches.len() == 0 {
+            None
+        } else {
+            Some(matches.first().unwrap().clone())
+        }
+    }
+
+    // Helper function to apply fixes based on the path
+    pub fn fix_json_value(&self, json: &mut JsonValue, path: &[PathSegment]) -> Result<(), String> {
+        match path.split_first() {
+            Some((PathSegment::MissingMetaType, _)) => {
+                if let JsonValue::Object(map) = json {
+                    if let Some(inferred_type) = self.infer_type_from_fields(map) {
+                        map.insert("_type".to_string(), JsonValue::String(inferred_type));
+                        Ok(())
+                    } else {
+                        Err("Could not unambiguously determine type from fields".to_string())
+                    }
+                } else {
+                    Err("Expected object".to_string())
+                }
+            }
+            Some((PathSegment::ArrayIndex(idx), rest)) => {
+                if let JsonValue::Array(arr) = json {
+                    if let Some(element) = arr.get_mut(*idx) {
+                        self.fix_json_value(element, rest)
+                    } else {
+                        Err(format!("Expected element in array at index {idx}"))
+                    }
+                } else {
+                    Err("Expected to be array at this level.".to_string())
+                }
+            }
+            Some((PathSegment::Field(field), rest)) => {
+                if rest.is_empty() {
+                    Err(format!("Missing field {field} from object."))
+                } else {
+                    if let JsonValue::Object(map) = json {
+                        match map.get_mut(field) {
+                            None => Err(format!("Missing field {field} from object.")),
+                            Some(json2) => self.fix_json_value(json2, rest),
+                        }
+                    } else {
+                        Err("Expected object".to_string())
+                    }
+                }
+            }
+            Some((PathSegment::UnionType(field, validation_errors), _)) => {
+                match json {
+                    JsonValue::Object(map) => {
+                        // Try each possible union type and its validation errors
+                        for (type_name, errors) in validation_errors {
+                            // Clone the object to try fixes without modifying original
+                            let mut test_json = json.clone();
+
+                            // Get a new path from these errors to try fixing
+                            let error_path = self.get_error_location(errors);
+
+                            // Try to fix the validation errors for this type
+                            let res = self.fix_json_value(&mut test_json, &error_path);
+                            if res.is_ok() {
+                                // If successful, apply the changes back to original
+                                *json = test_json;
+                                return Ok(());
+                            }
+                        }
+                        Err("Could not coerce to any union type".to_string())
+                    }
+                    _ => Err("Expected object for union type".to_string()),
+                }
+            }
+            Some((PathSegment::ExpectedType(field, expected), rest)) => match field {
+                None => {
+                    match expected.as_str() {
+                        "Array" => {
+                            *json = JsonValue::Array(vec![json.to_owned()]);
+                            Ok(())
+                        }
+                        "String" => match json {
+                            JsonValue::Number(n) => {
+                                *json = JsonValue::String(n.to_string());
+                                Ok(())
+                            }
+                            JsonValue::Boolean(b) => {
+                                *json = JsonValue::String(b.to_string());
+                                Ok(())
+                            }
+                            JsonValue::Null => {
+                                *json = JsonValue::String("null".to_string());
+                                Ok(())
+                            }
+                            JsonValue::String(_) => Ok(()), // Already a string
+                            _ => Err("Cannot convert to string".to_string()),
+                        },
+                        "Number" => match json {
+                            JsonValue::String(s) => {
+                                if let Ok(n) = s.parse::<i64>() {
+                                    *json = JsonValue::Number(Number::Integer(n.into()));
+                                    Ok(())
+                                } else {
+                                    Err("String is not a valid number".to_string())
+                                }
+                            }
+                            JsonValue::Boolean(b) => {
+                                *json = JsonValue::Number(Number::Integer(
+                                    if *b { 1 } else { 0 }.into(),
+                                ));
+                                Ok(())
+                            }
+                            JsonValue::Number(_) => Ok(()), // Already a number
+                            _ => Err("Cannot convert to number".to_string()),
+                        },
+                        "Boolean" => match json {
+                            JsonValue::String(s) => match s.to_lowercase().as_str() {
+                                "true" | "1" => {
+                                    *json = JsonValue::Boolean(true);
+                                    Ok(())
+                                }
+                                "false" | "0" => {
+                                    *json = JsonValue::Boolean(false);
+                                    Ok(())
+                                }
+                                _ => Err("String is not a valid boolean".to_string()),
+                            },
+                            JsonValue::Number(n) => {
+                                if n.is_i64() {
+                                    match n.as_i64() {
+                                        0 => {
+                                            *json = JsonValue::Boolean(false);
+                                            Ok(())
+                                        }
+                                        1 => {
+                                            *json = JsonValue::Boolean(true);
+                                            Ok(())
+                                        }
+                                        _ => Err("Number is not 0 or 1".to_string()),
+                                    }
+                                } else {
+                                    Err("Cannot convert float to boolean".to_string())
+                                }
+                            }
+                            JsonValue::Boolean(_) => Ok(()), // Already a bool
+                            _ => Err("Cannot convert to boolean".to_string()),
+                        },
+                        "Null" => {
+                            *json = JsonValue::Null;
+                            Ok(())
+                        }
+                        _ => Err("Unrecognized type for conversion".to_string()),
+                    }
+                }
+                Some(field_name) => match json {
+                    JsonValue::Object(map) => {
+                        if let Some(value) = map.get_mut(field_name) {
+                            self.fix_json_value(value, rest)?;
+                        }
+                        Ok(())
+                    }
+                    _ => Err(format!(
+                        "Cannot access field {} on non-object value",
+                        field_name
+                    )),
+                },
+            },
+            Some((PathSegment::Root((_template, variable)), rest)) => match variable {
+                Some(field_name) => match json {
+                    JsonValue::Object(map) => {
+                        if let Some(value) = map.get_mut(field_name) {
+                            self.fix_json_value(value, rest)?;
+                        }
+                        Ok(())
+                    }
+                    _ => Err(format!(
+                        "Cannot access field {} on non-object value",
+                        field_name
+                    )),
+                },
+                None => self.fix_json_value(json, rest),
+            },
+            None => Err("Invalid error path -no segments".to_string()),
+        }
+    }
+
+    pub fn validate_json(
+        &self,
+        json: &str,
+    ) -> Result<(), (String, Option<String>, JsonValidationError)> {
         let mut parser = JsonParser::new(json.as_bytes().to_vec());
-        let value = parser.parse().map_err(|e| e.to_string())?;
+        let value = parser.parse().map_err(|e| {
+            (
+                "".to_string(),
+                None,
+                JsonValidationError::JsonParserError(e),
+            )
+        })?;
 
         self.main
             .borrow()
             .as_ref()
             .unwrap()
             .validate_llm_response(&value, &self.template_registry.borrow())
+    }
+
+    pub fn validate_and_fix(&self, json: &mut JsonValue) -> Result<(), String> {
+        loop {
+            match self.validate_json(&json.to_string()) {
+                Ok(_) => return Ok(()),
+                Err((template, variable, err)) => {
+                    let mut path = self.get_error_location(&err);
+                    path.insert(0, PathSegment::Root((template, variable)));
+
+                    self.fix_json_value(json, &path)?;
+                }
+            }
+        }
     }
 
     pub fn validate(&self) -> (Vec<ValidationWarning>, Vec<ValidationError>) {
@@ -1266,7 +1998,7 @@ impl<'a> WAILParser<'a> {
                     // Validate each member type
                     for member_type in &union.members {
                         self.validate_type(
-                            member_type,
+                            &member_type.field_type,
                             registry,
                             template_name,
                             warnings,
@@ -1316,20 +2048,20 @@ impl<'a> WAILParser<'a> {
                         }
                     }
                 }
-                WAILCompositeType::Tool(_) => (), // Tool types are always valid
             },
             WAILType::Value(_) => (), // Literal values are always valid
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WAILDefinition<'a> {
     Object(WAILField<'a>),
     Template(WAILTemplateDef<'a>),
     Union(WAILField<'a>),
     Main(WAILMainDef<'a>),
     Comment(String),
+    Import(WAILImport),
 }
 
 impl<'a> WAILDefinition<'a> {
@@ -1384,7 +2116,8 @@ mod tests {
             age: Number
       }"#;
 
-        let parser = WAILParser::new();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
 
         let (_, object_def) = parser.parse_object(input).unwrap();
 
@@ -1398,7 +2131,7 @@ mod tests {
                         .as_ref()
                         .unwrap()
                         .len(),
-                    2
+                    3 // 2 for fields above and then implicity _type metadata field
                 );
             }
             _ => panic!("Expected object definition"),
@@ -1408,7 +2141,8 @@ mod tests {
     #[test]
     fn test_parse_template() {
         // First create a parser
-        let mut parser = WAILParser::new();
+        let test_dir = std::env::current_dir().unwrap();
+        let mut parser = WAILParser::new(test_dir);
 
         // Create and register the DateInfo type
         let date_info_fields = vec![
@@ -1521,7 +2255,8 @@ mod tests {
       """
    }"#;
 
-        let parser = WAILParser::new();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
 
         let (_, template_def) = parser.parse_template(input).unwrap();
 
@@ -1570,7 +2305,8 @@ mod tests {
 
     #[test]
     fn test_prompt_interpolation() {
-        let parser = WAILParser::new();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
 
         // Define DateInfo type
         let fields = vec![
@@ -1661,7 +2397,8 @@ Return in this format: {{return_type}}"#
 
     #[test]
     fn test_wail_parsing() {
-        let parser = WAILParser::new();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
 
         let input = r#"
       object Person {
@@ -1688,7 +2425,9 @@ Return in this format: {{return_type}}"#
       }
       "#;
 
-        let definitions = parser.parse_wail_file(input).unwrap();
+        let definitions = parser
+            .parse_wail_file(input.to_string(), WAILFileType::Application, true)
+            .unwrap();
         assert_eq!(
             definitions.len(),
             3,
@@ -1701,7 +2440,7 @@ Return in this format: {{return_type}}"#
                 assert_eq!(obj.name, "Person");
                 if let WAILType::Composite(WAILCompositeType::Object(obj)) = &obj.field_type {
                     let fields = obj.type_data.field_definitions.as_ref().unwrap();
-                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields.len(), 3); // 3 because objects have added _type fields
                     assert_eq!(fields[0].name, "name");
                     assert_eq!(fields[1].name, "age");
                 } else {
@@ -1759,6 +2498,40 @@ Return in this format: {{return_type}}"#
     }
 
     #[test]
+    fn test_circular_imports() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+
+        // Create a.lib.wail that imports from b
+        fs::write(
+            tmp.path().join("a.lib.wail"),
+            r#"import { B } from "b.lib.wail"
+        object A { field: String }"#,
+        )
+        .unwrap();
+
+        // Create b.lib.wail that imports from a
+        fs::write(
+            tmp.path().join("b.lib.wail"),
+            r#"import { A } from "a.lib.wail"
+        object B { field: String }"#,
+        )
+        .unwrap();
+
+        let parser = WAILParser::new(tmp.path().to_path_buf());
+
+        // Try to parse a file that starts the circular chain
+        let input = r#"import { A } from "a.lib.wail"
+    main { prompt { } }"#;
+
+        let result = parser.parse_wail_file(input.to_string(), WAILFileType::Application, true);
+        println!("{:?}", result);
+        assert!(matches!(result, Err(WAILParseError::CircularImport { .. })));
+    }
+
+    #[test]
     fn test_union_types() {
         let input = r#"
    object ErrorResult {
@@ -1806,8 +2579,9 @@ Return in this format: {{return_type}}"#
    }
    "#;
 
-        let parser = WAILParser::new();
-        let result = parser.parse_wail_file(input);
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
+        let result = parser.parse_wail_file(input.to_string(), WAILFileType::Application, true);
         assert!(result.is_ok());
 
         let prompt = parser.prepare_prompt(None);
@@ -1833,7 +2607,8 @@ Return in this format: {{return_type}}"#
 
     #[test]
     fn test_validation() {
-        let parser = WAILParser::new();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
 
         // First parse a template with undefined types
         let input = r#"template ProcessData(
@@ -1926,8 +2701,11 @@ Return in this format: {{return_type}}"#
    }
    "#;
 
-        let parser = WAILParser::new();
-        parser.parse_wail_file(input).unwrap();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
+        parser
+            .parse_wail_file(input.to_string(), WAILFileType::Application, true)
+            .unwrap();
 
         // Create test template args
         let mut obj = HashMap::new();
@@ -1983,8 +2761,11 @@ Return in this format: {{return_type}}"#
       prompt { {{result}} }
    }"#;
 
-        let parser = WAILParser::new();
-        parser.parse_wail_file(schema).unwrap();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
+        parser
+            .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
+            .unwrap();
 
         // Test gasp fence parsing
         let gasp_fence = r#"
@@ -2008,8 +2789,11 @@ Return in this format: {{return_type}}"#
       prompt { {{result}} {{result2}} }
    }"#;
 
-        let parser = WAILParser::new();
-        parser.parse_wail_file(schema).unwrap();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
+        parser
+            .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
+            .unwrap();
         // Test multiple gasp fences
         let multiple_fences = r#"
          First result:
@@ -2051,7 +2835,9 @@ Return in this format: {{return_type}}"#
                prompt { {{result}} }
          }"#;
 
-        parser.parse_wail_file(types_schema).unwrap();
+        parser
+            .parse_wail_file(types_schema.to_string(), WAILFileType::Application, true)
+            .unwrap();
 
         let number_fence = r#"
         <result>
@@ -2072,7 +2858,9 @@ Return in this format: {{return_type}}"#
                prompt { {{result}} }
          }"#;
 
-        parser.parse_wail_file(types_schema).unwrap();
+        parser
+            .parse_wail_file(types_schema.to_string(), WAILFileType::Application, true)
+            .unwrap();
 
         let array_fence = r#"
          <result>
@@ -2089,7 +2877,8 @@ Return in this format: {{return_type}}"#
 
     #[test]
     fn test_parse_object_as_argument_to_func() {
-        let parser = WAILParser::new();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
         let input = r#"
         object Article {
             content: String
@@ -2152,7 +2941,7 @@ Return in this format: {{return_type}}"#
             }
         }
         "#;
-        let result = parser.parse_wail_file(input);
+        let result = parser.parse_wail_file(input.to_string(), WAILFileType::Application, true);
         assert!(
             result.is_ok(),
             "Failed to parse ideal.wail: {:?}",
@@ -2177,7 +2966,8 @@ Return in this format: {{return_type}}"#
 
     #[test]
     fn test_parse_ideal_wail() {
-        let parser = WAILParser::new();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
         let input = r#"object RealtimeEvent {
    type: String  # response.create, response.chunk, response.end
    response: {
@@ -2237,7 +3027,7 @@ main {
    }
 }"#;
 
-        let result = parser.parse_wail_file(input);
+        let result = parser.parse_wail_file(input.to_string(), WAILFileType::Application, true);
         assert!(
             result.is_ok(),
             "Failed to parse ideal.wail: {:?}",
@@ -2254,7 +3044,7 @@ main {
         assert_eq!(realtime_event.name, "RealtimeEvent");
         if let WAILType::Composite(WAILCompositeType::Object(obj)) = &realtime_event.field_type {
             let fields = obj.type_data.field_definitions.as_ref().unwrap();
-            assert_eq!(fields.len(), 2); // type and response fields
+            assert_eq!(fields.len(), 3); // type and response fields + _type metadata
             assert_eq!(fields[0].name, "type");
             assert_eq!(fields[1].name, "response");
         } else {
@@ -2269,7 +3059,7 @@ main {
         assert_eq!(message.name, "Message");
         if let WAILType::Composite(WAILCompositeType::Object(obj)) = &message.field_type {
             let fields = obj.type_data.field_definitions.as_ref().unwrap();
-            assert_eq!(fields.len(), 2); // content and role fields
+            assert_eq!(fields.len(), 3); // content and role fields + implicit _type metadata
             assert_eq!(fields[0].name, "content");
             assert_eq!(fields[1].name, "role");
         } else {
@@ -2284,7 +3074,7 @@ main {
         assert_eq!(conversation.name, "Conversation");
         if let WAILType::Composite(WAILCompositeType::Object(obj)) = &conversation.field_type {
             let fields = obj.type_data.field_definitions.as_ref().unwrap();
-            assert_eq!(fields.len(), 4); // messages, model, temperature, max_tokens
+            assert_eq!(fields.len(), 5); // messages, model, temperature, max_tokens + implicit _type field
             assert_eq!(fields[0].name, "messages");
             assert_eq!(fields[1].name, "model");
             assert_eq!(fields[2].name, "temperature");
@@ -2337,8 +3127,77 @@ main {
     }
 
     #[test]
+    fn test_parse_imports() {
+        let input = r#"
+    import { Person, Address } from "types.lib.wail"
+    import { GetPerson } from "templates.lib.wail"
+
+    object Config {
+        name: String
+    }
+
+    main {
+        prompt { }
+    }
+    "#;
+
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+
+        // Create a.lib.wail that imports from b
+        fs::write(
+            tmp.path().join("types.lib.wail"),
+            r#"
+            object Person {
+                name: String
+            }
+            object Address {
+                street: String
+            }
+        "#,
+        )
+        .unwrap();
+
+        fs::write(
+            tmp.path().join("templates.lib.wail"),
+            r#"
+            template GetPerson(name: String) -> String {
+                prompt: """
+                {{return_type}}
+                """
+            }"#,
+        )
+        .unwrap();
+
+        let parser = WAILParser::new(tmp.path().to_path_buf());
+        let definitions = parser
+            .parse_wail_file(input.to_string(), WAILFileType::Application, true)
+            .unwrap();
+
+        // First two definitions should be imports
+        match &definitions[0] {
+            WAILDefinition::Import(import) => {
+                assert_eq!(import.items, vec!["Person", "Address"]);
+                assert_eq!(import.path, "types.lib.wail");
+            }
+            _ => panic!("Expected first definition to be import"),
+        }
+
+        match &definitions[1] {
+            WAILDefinition::Import(import) => {
+                assert_eq!(import.items, vec!["GetPerson"]);
+                assert_eq!(import.path, "templates.lib.wail");
+            }
+            _ => panic!("Expected second definition to be import"),
+        }
+    }
+
+    #[test]
     fn test_wail_errors() {
-        let parser = WAILParser::new();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
 
         // Test duplicate object definition
         let input = r#"
@@ -2353,7 +3212,9 @@ main {
       }
       "#;
 
-        let err = parser.parse_wail_file(input).unwrap_err();
+        let err = parser
+            .parse_wail_file(input.to_string(), WAILFileType::Application, true)
+            .unwrap_err();
         assert!(
             matches!(err, WAILParseError::DuplicateDefinition { name, .. } if name == "Person")
         );
@@ -2365,7 +3226,9 @@ main {
       }
       "#;
 
-        let err = parser.parse_wail_file(input).unwrap_err();
+        let err = parser
+            .parse_wail_file(input.to_string(), WAILFileType::Application, true)
+            .unwrap_err();
         assert!(matches!(err, WAILParseError::MissingMainBlock));
 
         // Test unexpected token
@@ -2379,7 +3242,9 @@ main {
       }
       "#;
 
-        let err = parser.parse_wail_file(input).unwrap_err();
+        let err = parser
+            .parse_wail_file(input.to_string(), WAILFileType::Application, true)
+            .unwrap_err();
 
         assert!(
             matches!(err, WAILParseError::UnexpectedToken { found, .. } if found == "age: @ Number")

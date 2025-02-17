@@ -55,7 +55,45 @@ impl Parser {
         self.skip_whitespace();
 
         match self.peek_byte()? {
-            b'{' => self.parse_object(),
+            b'{' => {
+                let obj = self.parse_object()?;
+
+                // Only handle implicit arrays if we're at the root level
+                if self.stack.is_empty() {
+                    self.skip_whitespace();
+                    // First check if we have more input
+                    if self.pos < self.container.len() {
+                        let mut arr = Vec::new();
+                        arr.push(obj);
+
+                        loop {
+                            // Skip comma if present but don't require it
+                            if self.pos < self.container.len() && self.container[self.pos] == b',' {
+                                self.pos += 1;
+                            }
+
+                            self.skip_whitespace();
+
+                            if self.pos >= self.container.len() {
+                                break;
+                            }
+
+                            // Check for another object
+                            if self.container[self.pos] == b'{' {
+                                arr.push(self.parse_object()?);
+                                self.skip_whitespace();
+                            } else {
+                                break;
+                            }
+                        }
+                        Ok(JsonValue::Array(arr))
+                    } else {
+                        Ok(obj)
+                    }
+                } else {
+                    Ok(obj)
+                }
+            }
             b'[' => self.parse_array(),
             b'"' | b'\'' => {
                 let quote = self.peek_byte()?;
@@ -770,7 +808,45 @@ impl Parser {
 
     fn parse_value_fallback(&mut self) -> Result<JsonValue, JsonError> {
         match self.peek_byte()? {
-            b'{' => self.parse_object_fallback(),
+            b'{' => {
+                let obj = self.parse_object_fallback()?;
+
+                // Only handle implicit arrays if we're at the root level
+                if self.stack.is_empty() {
+                    self.skip_whitespace_fallback();
+                    // First check if we have more input
+                    if self.pos < self.container.len() {
+                        let mut arr = Vec::new();
+                        arr.push(obj);
+
+                        loop {
+                            // Skip comma if present but don't require it
+                            if self.pos < self.container.len() && self.container[self.pos] == b',' {
+                                self.pos += 1;
+                            }
+
+                            self.skip_whitespace_fallback();
+
+                            if self.pos >= self.container.len() {
+                                break;
+                            }
+
+                            // Check for another object
+                            if self.container[self.pos] == b'{' {
+                                arr.push(self.parse_object_fallback()?);
+                                self.skip_whitespace_fallback();
+                            } else {
+                                break;
+                            }
+                        }
+                        Ok(JsonValue::Array(arr))
+                    } else {
+                        Ok(obj)
+                    }
+                } else {
+                    Ok(obj)
+                }
+            }
             b'[' => self.parse_array_fallback(),
             b'"' | b'\'' => {
                 let quote = self.peek_byte()?;
@@ -1111,6 +1187,108 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_implicit_arrays() {
+        // Test comma-separated
+        let input = r#"{"message": 123},{"code": 404}"#.as_bytes().to_vec();
+        let mut parser = Parser::new(input);
+        match parser.parse() {
+            Ok(JsonValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                match &arr[0] {
+                    JsonValue::Object(obj) => assert_eq!(
+                        obj.get("message").unwrap(),
+                        &JsonValue::Number(Number::Integer(123))
+                    ),
+                    _ => panic!("Expected first element to be object"),
+                }
+                match &arr[1] {
+                    JsonValue::Object(obj) => assert_eq!(
+                        obj.get("code").unwrap(),
+                        &JsonValue::Number(Number::Integer(404))
+                    ),
+                    _ => panic!("Expected second element to be object"),
+                }
+            }
+            _ => panic!("Expected array"),
+        }
+
+        // Test space-separated
+        let input = r#"{"message": 123} {"code": 404}"#.as_bytes().to_vec();
+        let mut parser = Parser::new(input);
+        match parser.parse() {
+            Ok(JsonValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                match &arr[0] {
+                    JsonValue::Object(obj) => assert_eq!(
+                        obj.get("message").unwrap(),
+                        &JsonValue::Number(Number::Integer(123))
+                    ),
+                    _ => panic!("Expected first element to be object"),
+                }
+                match &arr[1] {
+                    JsonValue::Object(obj) => assert_eq!(
+                        obj.get("code").unwrap(),
+                        &JsonValue::Number(Number::Integer(404))
+                    ),
+                    _ => panic!("Expected second element to be object"),
+                }
+            }
+            _ => panic!("Expected array"),
+        }
+
+        // Test newline-separated
+        let input = r#"{"message": 123}
+    {"code": 404}"#
+            .as_bytes()
+            .to_vec();
+        let mut parser = Parser::new(input);
+        match parser.parse() {
+            Ok(JsonValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                match &arr[0] {
+                    JsonValue::Object(obj) => assert_eq!(
+                        obj.get("message").unwrap(),
+                        &JsonValue::Number(Number::Integer(123))
+                    ),
+                    _ => panic!("Expected first element to be object"),
+                }
+                match &arr[1] {
+                    JsonValue::Object(obj) => assert_eq!(
+                        obj.get("code").unwrap(),
+                        &JsonValue::Number(Number::Integer(404))
+                    ),
+                    _ => panic!("Expected second element to be object"),
+                }
+            }
+            _ => panic!("Expected array"),
+        }
+
+        // Test no separation
+        let input = r#"{"message": 123}{"code": 404}"#.as_bytes().to_vec();
+        let mut parser = Parser::new(input);
+        match parser.parse() {
+            Ok(JsonValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                match &arr[0] {
+                    JsonValue::Object(obj) => assert_eq!(
+                        obj.get("message").unwrap(),
+                        &JsonValue::Number(Number::Integer(123))
+                    ),
+                    _ => panic!("Expected first element to be object"),
+                }
+                match &arr[1] {
+                    JsonValue::Object(obj) => assert_eq!(
+                        obj.get("code").unwrap(),
+                        &JsonValue::Number(Number::Integer(404))
+                    ),
+                    _ => panic!("Expected second element to be object"),
+                }
+            }
+            _ => panic!("Expected array"),
+        }
+    }
+
+    #[test]
     fn test_simple_string() {
         let input = r#""hello world""#.as_bytes().to_vec();
         let mut parser = Parser::new(input);
@@ -1335,6 +1513,34 @@ mod tests {
                 assert_eq!(map.get("type").unwrap().as_string().unwrap(), "user");
             }
             _ => panic!("Expected object"),
+        }
+    }
+
+    #[test]
+    fn test_malformed_array() {
+        let input = r#"{"message": 123},
+            {"code": "404", "details": "error"}"#
+            .as_bytes()
+            .to_vec();
+        let mut parser = Parser::new(input);
+        match parser.parse() {
+            Ok(JsonValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                match &arr[0] {
+                    JsonValue::Object(obj) => {
+                        assert!(obj.contains_key("message"));
+                    }
+                    _ => panic!("Expected first element to be object"),
+                }
+                match &arr[1] {
+                    JsonValue::Object(obj) => {
+                        assert!(obj.contains_key("code"));
+                        assert!(obj.contains_key("details"));
+                    }
+                    _ => panic!("Expected second element to be object"),
+                }
+            }
+            _ => panic!("Expected array"),
         }
     }
 

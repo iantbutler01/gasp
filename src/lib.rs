@@ -7,23 +7,15 @@ mod rd_json_stack_parser;
 mod template_parser;
 mod types;
 mod wail_parser;
-use nom::{
-    branch::alt,
-    bytes::complete::{tag, take_until, take_while1},
-    character::complete::{alpha1, char, multispace0, multispace1},
-    combinator::opt,
-    multi::{many0, separated_list0},
-    sequence::{delimited, preceded, tuple},
-    IResult,
-};
 
 use pyo3::types::{PyDict, PyFloat, PyList, PyLong, PyString};
 use pyo3::Python;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use types::JsonValidationError;
+use wail_parser::WAILFileType;
 
 use crate::json_types::{JsonValue, Number};
-
-use rd_json_stack_parser::Parser as JsonParser;
 
 fn json_value_to_py_object(py: Python, value: &JsonValue) -> PyObject {
     match value {
@@ -56,14 +48,22 @@ fn json_value_to_py_object(py: Python, value: &JsonValue) -> PyObject {
 #[derive(Debug)]
 struct WAILGenerator {
     wail_content: String,
+    base_dir: PathBuf,
 }
 
 #[pymethods]
 impl WAILGenerator {
     #[new]
-    fn new() -> Self {
+    #[pyo3(text_signature = "(base_dir=None)")]
+    fn new(base_dir: Option<String>) -> Self {
+        let dir = match base_dir {
+            Some(path) => PathBuf::from(path),
+            None => std::env::current_dir().unwrap(),
+        };
+
         Self {
             wail_content: String::new(),
+            base_dir: dir,
         }
     }
 
@@ -75,8 +75,9 @@ impl WAILGenerator {
 
         self.wail_content = content;
 
-        let parser = wail_parser::WAILParser::new();
-        let res = parser.parse_wail_file(&self.wail_content);
+        let parser = wail_parser::WAILParser::new(self.base_dir.clone());
+        let res =
+            parser.parse_wail_file(self.wail_content.clone(), WAILFileType::Application, true);
 
         match res {
             Ok(_) => Ok(None),
@@ -111,6 +112,26 @@ impl WAILGenerator {
                     wail_parser::WAILParseError::MissingMainBlock => {
                         py_dict.set_item("error_type", "MissingMainBlock")?;
                     }
+                    wail_parser::WAILParseError::CircularImport { path, chain } => {
+                        py_dict.set_item("error_type", "CircularImport")?;
+                        py_dict.set_item("path", path)?;
+                        py_dict.set_item("chain", chain)?;
+                    }
+                    wail_parser::WAILParseError::InvalidImportPath { path, error } => {
+                        py_dict.set_item("error_type", "InvalidImportPath")?;
+                        py_dict.set_item("path", path)?;
+                        py_dict.set_item("error", error)?;
+                    }
+                    wail_parser::WAILParseError::FileError { path, error } => {
+                        py_dict.set_item("error_type", "FileError")?;
+                        py_dict.set_item("path", path)?;
+                        py_dict.set_item("error", error)?;
+                    }
+                    wail_parser::WAILParseError::ImportNotFound { name, path } => {
+                        py_dict.set_item("error_type", "ImportNotFound")?;
+                        py_dict.set_item("name", name)?;
+                        py_dict.set_item("path", path)?;
+                    }
                     wail_parser::WAILParseError::InvalidTemplateCall {
                         template_name,
                         reason,
@@ -132,7 +153,7 @@ impl WAILGenerator {
         &self,
         kwargs: Option<&PyDict>,
     ) -> PyResult<(Option<String>, Vec<String>, Vec<String>)> {
-        let parser = wail_parser::WAILParser::new();
+        let parser = wail_parser::WAILParser::new(self.base_dir.clone());
 
         // Convert kwargs to HashMap<String, JsonValue> if provided
         let template_arg_values = if let Some(kwargs) = kwargs {
@@ -161,7 +182,7 @@ impl WAILGenerator {
         };
 
         // First parse and validate the WAIL schema
-        match parser.parse_wail_file(&self.wail_content) {
+        match parser.parse_wail_file(self.wail_content.clone(), WAILFileType::Application, true) {
             Ok(_) => {
                 let (warnings, errors) = parser.validate();
 
@@ -229,10 +250,12 @@ impl WAILGenerator {
     #[pyo3(text_signature = "($self, llm_output)")]
     fn parse_llm_output(&self, llm_output: String) -> PyResult<PyObject> {
         // Do all JSON parsing and validation outside the GIL
-        let parser = wail_parser::WAILParser::new();
+        let parser = wail_parser::WAILParser::new(self.base_dir.clone());
 
         // Parse WAIL schema first
-        if let Err(e) = parser.parse_wail_file(&self.wail_content) {
+        if let Err(e) =
+            parser.parse_wail_file(self.wail_content.clone(), WAILFileType::Application, true)
+        {
             return Err(PyValueError::new_err(format!(
                 "Failed to parse WAIL schema: {:?}",
                 e
@@ -240,15 +263,13 @@ impl WAILGenerator {
         }
 
         // Parse and validate the LLM output
-        let parsed_output = parser
+        let mut parsed_output = parser
             .parse_llm_output(&llm_output)
             .map_err(|e| PyValueError::new_err(format!("Failed to parse LLM output: {:?}", e)))?;
 
-        parser
-            .validate_json(&parsed_output.to_string())
-            .map_err(|e| {
-                PyValueError::new_err(format!("Failed to validate LLM output: {:?}", e))
-            })?;
+        parser.validate_and_fix(&mut parsed_output).map_err(|e| {
+            PyValueError::new_err(format!("Failed to validate LLM output: {:?}", e))
+        })?;
 
         // Only acquire the GIL when we need to create Python objects
         Python::with_gil(|py| Ok(json_value_to_py_object(py, &parsed_output)))
@@ -257,10 +278,10 @@ impl WAILGenerator {
     /// Validate the loaded WAIL schema and the LLM output against the schema
     #[pyo3(text_signature = "($self)")]
     fn validate_wail(&self) -> PyResult<(Vec<String>, Vec<String>)> {
-        let parser = wail_parser::WAILParser::new();
+        let parser = wail_parser::WAILParser::new(self.base_dir.clone());
 
         // First parse and validate the WAIL schema
-        match parser.parse_wail_file(&self.wail_content) {
+        match parser.parse_wail_file(self.wail_content.clone(), WAILFileType::Application, true) {
             Ok(_) => {
                 let (warnings, errors) = parser.validate();
 
@@ -327,6 +348,8 @@ fn gasp(_py: Python, m: &PyModule) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::env::var;
+
     use super::*;
 
     #[test]
@@ -345,11 +368,16 @@ mod tests {
         prompt { {{person}} }
     }"#;
 
-        let parser = wail_parser::WAILParser::new();
-        parser.parse_wail_file(schema).unwrap();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = wail_parser::WAILParser::new(test_dir);
+        parser
+            .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
+            .unwrap();
 
-        let valid = r#"{"person": {"name": "Alice", "age": 25, "interests": ["coding"]}}"#;
-        assert!(parser.validate_json(valid).is_ok());
+        let valid = r#"{"person": {"name": "Alice", "age": 25, "interests": ["coding"], "_type": "Person"}}"#;
+        let res = parser.validate_json(valid);
+        println!("res {:?}", res);
+        assert!(res.is_ok());
 
         let invalid_types = r#"{"person": {"name": 42, "age": "25", "interests": "coding"}}"#;
         assert!(parser.validate_json(invalid_types).is_err());
@@ -385,17 +413,23 @@ mod tests {
        prompt { {{container}} }
    }"#;
 
-        let parser = wail_parser::WAILParser::new();
-        parser.parse_wail_file(schema).unwrap();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = wail_parser::WAILParser::new(test_dir);
+        parser
+            .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
+            .unwrap();
 
         // Valid array of union objects
         let valid = r#"{"container": {
+        "_type": "Container",
        "items": [
-           {"message": "ok"},
-           {"code": 404, "message": "Not found"}
+           {"message": "ok", "_type": "Success"},
+           {"code": 404, "message": "Not found", "_type": "Error"}
        ]
    }}"#;
-        assert!(parser.validate_json(valid).is_ok());
+        let res = parser.validate_json(valid);
+        println!("{:?}", res);
+        assert!(res.is_ok());
 
         // Invalid - object missing required field
         let invalid_obj = r#"{"container": {
@@ -429,12 +463,15 @@ mod tests {
                prompt { {{result}} }
            }"#;
 
-            let parser = wail_parser::WAILParser::new();
-            parser.parse_wail_file(schema).unwrap();
+            let test_dir = std::env::current_dir().unwrap();
+            let parser = wail_parser::WAILParser::new(test_dir);
+            parser
+                .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
+                .unwrap();
 
             let valid_success = r#"
             <result>
-            {"message": "ok"}
+            {"message": "ok", "_type": "Success"}
             </result>
             "#;
             let res = parser.parse_llm_output(valid_success);
@@ -445,14 +482,14 @@ mod tests {
             assert!(res2.is_ok());
 
             let valid_error = r#"<result>
-            {"code": 404}
+            {"code": 404, "_type": "Code"}
             </result>"#;
             let res = parser.parse_llm_output(valid_error);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_ok());
 
             let invalid = r#"<result>
-            {"code": "404"}
+            {"code": "404", "_type": "Code"}
             </result>"#;
             let res = parser.parse_llm_output(invalid);
             assert!(res.is_ok());
@@ -475,20 +512,23 @@ mod tests {
                prompt { {{result}} }
            }"#;
 
-            let parser = wail_parser::WAILParser::new();
-            parser.parse_wail_file(schema).unwrap();
+            let test_dir = std::env::current_dir().unwrap();
+            let parser = wail_parser::WAILParser::new(test_dir);
+            parser
+                .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
+                .unwrap();
 
-            let valid_success = r#"<result>{"message": "ok"}</result>"#;
+            let valid_success = r#"<result>{"message": "ok", "_type": "Success"}</result>"#;
             let res = parser.parse_llm_output(valid_success);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_ok());
 
-            let valid_error = r#"<result>{"code": 404}</result>"#;
+            let valid_error = r#"<result>{"code": 404, "_type": "Error"}</result>"#;
             let res = parser.parse_llm_output(valid_error);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_ok());
 
-            let invalid = r#"<result>{"code": "404"}</result>"#;
+            let invalid = r#"<result>{"code": "404", "_type": "Error"}</result>"#;
             let res = parser.parse_llm_output(invalid);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_err());
@@ -510,20 +550,23 @@ mod tests {
                prompt { {{result}} }
            }"#;
 
-            let parser = wail_parser::WAILParser::new();
-            parser.parse_wail_file(schema).unwrap();
+            let test_dir = std::env::current_dir().unwrap();
+            let parser = wail_parser::WAILParser::new(test_dir);
+            parser
+                .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
+                .unwrap();
 
             let valid = r#"<result>[
-               {"message": "ok"},
-               {"code": 404}
+               {"message": "ok", "_type": "Success"},
+               {"code": 404, "_type": "Error"}
            ]</result>"#;
             let res = parser.parse_llm_output(valid);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_ok());
 
             let invalid = r#"<result>[
-               {"message": "ok"},
-               {"code": "404"}
+               {"message": "ok", "_type": "Success"},
+               {"code": "404", "_type": "Error"}
            ]</result>"#;
             let res = parser.parse_llm_output(invalid);
             assert!(res.is_ok());
@@ -532,53 +575,210 @@ mod tests {
     }
 
     #[test]
+    fn test_bad_array_recovery() {
+        let schema = r#"
+        object Success { message: String }
+        object Error { 
+            code: Number
+            details: String
+        }
+        union Response = Success | Error;
+        
+        template Test() -> Response[] {
+            prompt: """Test"""
+        }
+        
+        main {
+            let result = Test();
+            prompt { {{result}} }
+        }"#;
+
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = wail_parser::WAILParser::new(test_dir);
+        parser
+            .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
+            .unwrap();
+
+        let result = r#"
+        <result>
+            {"message": 123},
+            {"code": "404", "details": "error"}
+</result>
+        "#;
+
+        let mut json = parser.parse_llm_output(&result).unwrap();
+
+        parser.validate_and_fix(&mut json).unwrap();
+
+        println!("{:?}", json.to_string());
+    }
+
+    #[test]
     fn test_validation_error_messages() {
         let schema = r#"
-    object Success { message: String }
-    object Error { 
-        code: Number
-        details: String
-    }
-    union Response = Success | Error;
-    
-    template Test() -> Response[] {
-        prompt: """Test"""
-    }
-    
-    main {
-        let result = Test();
-        prompt { {{result}} }
-    }"#;
+        object Success { message: String }
+        object Error { 
+            code: Number
+            details: String
+        }
+        union Response = Success | Error;
+        
+        template Test() -> Response[] {
+            prompt: """Test"""
+        }
+        
+        main {
+            let result = Test();
+            prompt { {{result}} }
+        }"#;
 
-        let parser = wail_parser::WAILParser::new();
-        parser.parse_wail_file(schema).unwrap();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = wail_parser::WAILParser::new(test_dir);
+        parser
+            .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
+            .unwrap();
 
         // Test wrong type in array
         let wrong_type = r#"{"result": [
-        {"message": 123},
-        {"code": "404", "details": "error"}
-    ]}"#;
+            {"message": 123},
+            {"code": "404", "details": "error"}
+        ]}"#;
+
         let err = parser.validate_json(wrong_type).unwrap_err();
-        assert!(err.contains("Array element at index 0"));
-        assert!(err.contains("Field 'message'"));
-        assert!(err.contains("expected String"));
+
+        if let (_, _, JsonValidationError::ArrayElementTypeError((0, box_err))) = &err {
+            println!("{:?}", box_err);
+
+            if let JsonValidationError::NotMemberOfUnion((_, errors)) = &**box_err {
+                let (_msg, box2_err) = errors.first().unwrap();
+
+                let JsonValidationError::ObjectNestedTypeValidation((field, _)) = &**box2_err
+                else {
+                    panic!("not_field");
+                };
+
+                assert_eq!(*field, "message".to_string());
+            } else {
+                panic!("Expected ");
+            }
+        } else {
+            panic!("Expected ArrayElementTypeError");
+        }
 
         // Test invalid union type
         let invalid_union = r#"{"result": [
-        {"something": "wrong"}
-    ]}"#;
-        let err = parser.validate_json(invalid_union).unwrap_err();
-        println!("{:?}", err);
-        assert!(err.contains("Array element at index 0"));
-        assert!(err.contains("Expected one of: Success | Error"));
+            {"something": "wrong"}
+        ]}"#;
+        let (_, _, err) = parser.validate_json(invalid_union).unwrap_err();
+        assert!(matches!(err,
+            JsonValidationError::ArrayElementTypeError((0, box_err))
+            if matches!(*box_err, JsonValidationError::NotMemberOfUnion(_))
+        ));
 
         // Test wrong type in nested field
         let wrong_nested = r#"{"result": [
-        {"code": false, "details": "error"}
-    ]}"#;
+            {"code": false, "details": "error"}
+        ]}"#;
         let err = parser.validate_json(wrong_nested).unwrap_err();
-        assert!(err.contains("Array element at index 0"));
-        assert!(err.contains("Field 'code'"));
-        assert!(err.contains("expected Number"));
+        println!("{:?}", err);
+        if let (_, _, JsonValidationError::ArrayElementTypeError((0, box_err))) = &err {
+            println!("{:?}", box_err);
+
+            if let JsonValidationError::NotMemberOfUnion((_, errors)) = &**box_err {
+                let (_msg, box2_err) = errors.last().unwrap();
+
+                println!("{:?}", box2_err);
+
+                let JsonValidationError::ObjectNestedTypeValidation((field, _)) = &**box2_err
+                else {
+                    panic!("not_field");
+                };
+
+                assert_eq!(*field, "code".to_string());
+            } else {
+                panic!("Expected ");
+            }
+        } else {
+            panic!("Expected ArrayElementTypeError");
+        }
+    }
+    #[test]
+    fn test_json_fix() {
+        let schema = r#"
+            object Success { message: String }
+            object Error { 
+                code: Number
+                details: String
+            }
+            union Response = Success | Error;
+            
+            template Test() -> Response[] {
+                prompt: """Test"""
+            }
+            
+            main {
+                let result = Test();
+                prompt { {{result}} }
+            }"#;
+
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = wail_parser::WAILParser::new(test_dir);
+        parser
+            .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
+            .unwrap();
+
+        // Test wrong type in array
+        let wrong_type = r#"{"result": [
+            {"message": 123},
+            {"code": "404", "details": "error"}
+        ]}"#;
+
+        use crate::rd_json_stack_parser::Parser;
+        let mut json = Parser::new(wrong_type.as_bytes().to_vec()).parse().unwrap();
+
+        // First validate to get the error
+        parser.validate_and_fix(&mut json).unwrap();
+
+        // Check that the fixes were applied correctly
+        if let JsonValue::Object(obj) = &json {
+            if let Some(JsonValue::Array(arr)) = obj.get("result") {
+                if let Some(JsonValue::Object(first_obj)) = arr.get(0) {
+                    if let Some(JsonValue::String(message)) = first_obj.get("message") {
+                        assert_eq!(message, "123");
+                    } else {
+                        panic!("message was not converted to string");
+                    }
+                }
+                if let Some(JsonValue::Object(second_obj)) = arr.get(1) {
+                    if let Some(JsonValue::Number(Number::Integer(code))) = second_obj.get("code") {
+                        assert_eq!(*code, 404);
+                    } else {
+                        panic!("code was not converted to number");
+                    }
+                }
+            }
+        }
+
+        let wrong_type = r#"{"result":
+            {"message": 123},
+        }"#;
+
+        let mut json = Parser::new(wrong_type.as_bytes().to_vec()).parse().unwrap();
+
+        // First validate to get the error
+        parser.validate_and_fix(&mut json).unwrap();
+
+        // Check that the fixes were applied correctly
+        if let JsonValue::Object(obj) = &json {
+            if let Some(JsonValue::Array(arr)) = obj.get("result") {
+                if let Some(JsonValue::Object(first_obj)) = arr.get(0) {
+                    if let Some(JsonValue::String(message)) = first_obj.get("message") {
+                        assert_eq!(message, "123");
+                    } else {
+                        panic!("message was not converted to string");
+                    }
+                }
+            }
+        }
     }
 }

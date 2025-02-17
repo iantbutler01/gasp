@@ -2,9 +2,10 @@ use crate::json_types::{JsonValue, Number};
 use crate::types::*;
 use regex;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::marker::PhantomData;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WAILAnnotation {
     Description(String), // Detailed explanation of purpose/meaning
     Example(String),     // Concrete examples of valid values/usage
@@ -20,13 +21,28 @@ pub enum WAILAnnotation {
     },
 }
 
-#[derive(Debug, Clone)]
-pub struct WAILUnionDef<'a> {
-    pub name: String,
-    pub members: Vec<WAILType<'a>>,
+impl Display for WAILAnnotation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WAILAnnotation::Description(desc) => write!(f, "Description: {}", desc),
+            WAILAnnotation::Example(ex) => write!(f, "Example: {}", ex),
+            WAILAnnotation::Validation(rule) => write!(f, "Validation: {}", rule),
+            WAILAnnotation::Format(fmt) => write!(f, "Format: {}", fmt),
+            WAILAnnotation::Important(note) => write!(f, "Important: {}", note),
+            WAILAnnotation::Context(ctx) => write!(f, "Context: {}", ctx),
+            WAILAnnotation::Default(def) => write!(f, "Default: {}", def),
+            WAILAnnotation::Field { name, annotations } => {
+                write!(f, "Field: {}\n", name)?;
+                for annotation in annotations {
+                    write!(f, "  {}\n", annotation)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TemplateArgument {
     String(String),
     Number(i64),
@@ -36,13 +52,13 @@ pub enum TemplateArgument {
     ObjectRef(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WAILTemplateCall {
     pub template_name: String,
     pub arguments: HashMap<String, TemplateArgument>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MainStatement {
     Assignment {
         variable: String,
@@ -57,7 +73,7 @@ pub enum MainStatement {
     Comment(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WAILField<'a> {
     pub name: String,
     pub field_type: WAILType<'a>,
@@ -77,7 +93,7 @@ pub struct WAILObjectInstantiation {
     pub fields: HashMap<String, TemplateArgument>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WAILTemplateDef<'a> {
     pub name: String,
     pub inputs: Vec<WAILField<'a>>,
@@ -86,7 +102,7 @@ pub struct WAILTemplateDef<'a> {
     pub annotations: Vec<WAILAnnotation>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WAILMainDef<'a> {
     pub statements: Vec<MainStatement>,
     pub prompt: String,
@@ -160,7 +176,6 @@ impl<'a> WAILMainDef<'a> {
 
         use crate::template_parser::{parse_template, TemplateSegment};
 
-        println!("{:?}", self.statements);
         // Parse the template into nodes
         let nodes =
             parse_template(&result).map_err(|e| format!("Template parsing error: {}", e))?;
@@ -168,7 +183,6 @@ impl<'a> WAILMainDef<'a> {
         let mut output = String::new();
         let (_, segments) = nodes;
 
-        println!("Segments: {:?}", segments);
         for node in segments {
             match node {
                 TemplateSegment::Text(text) => output.push_str(&text),
@@ -179,7 +193,6 @@ impl<'a> WAILMainDef<'a> {
                             variable,
                             template_call,
                         } if variable == &var_name => {
-                            println!("HERE {:?}", var_name);
                             let template = template_registry.get(&template_call.template_name)?;
 
                             template
@@ -469,7 +482,7 @@ impl<'a> WAILMainDef<'a> {
         &self,
         json: &JsonValue,
         registry: &HashMap<String, WAILTemplateDef<'a>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), (String, Option<String>, JsonValidationError)> {
         // For each template call in statements, validate its output
         for statement in &self.statements {
             match statement {
@@ -479,7 +492,13 @@ impl<'a> WAILMainDef<'a> {
                 } => {
                     // Get the template's output type from registry
                     let template = registry.get(&template_call.template_name).ok_or_else(|| {
-                        format!("Template not found: {}", template_call.template_name)
+                        (
+                            template_call.template_name.clone(),
+                            Some(variable.clone()),
+                            JsonValidationError::TemplateNotFound(
+                                template_call.template_name.clone(),
+                            ),
+                        )
                     })?;
 
                     let template_output = &template.output;
@@ -487,37 +506,77 @@ impl<'a> WAILMainDef<'a> {
                     // Get the corresponding value from JSON response
                     let value = match json {
                         JsonValue::Object(map) => map.get(variable).ok_or_else(|| {
-                            format!("Missing output for template call: {}", variable)
+                            (
+                                template_call.template_name.clone(),
+                                Some(variable.clone()),
+                                JsonValidationError::MissingTemplateResponse(variable.clone()),
+                            )
                         })?,
-                        _ => return Err("Expected object response from LLM".to_string()),
+                        _ => {
+                            return Err((
+                                template_call.template_name.clone(),
+                                Some(variable.clone()),
+                                JsonValidationError::ExpectedObject(),
+                            ))
+                        }
                     };
 
                     // Validate the value against the template's output type
-                    template_output.field_type.validate_json(value)?;
+                    template_output
+                        .field_type
+                        .validate_json(value)
+                        .map_err(|e| {
+                            (
+                                template_call.template_name.clone(),
+                                Some(variable.clone()),
+                                e,
+                            )
+                        })?;
                 }
                 MainStatement::TemplateCall(template_call) => {
                     // Similar validation for direct template calls
-                    let template = registry.get(&template_call.template_name).ok_or_else(|| {
-                        format!("Template not found: {}", template_call.template_name)
-                    })?;
+                    let template_res = registry.get(&template_call.template_name);
+
+                    let template = match template_res {
+                        Some(t) => t,
+                        None => {
+                            return Err((
+                                template_call.template_name.clone(),
+                                None::<String>,
+                                JsonValidationError::MissingTemplateResponse(
+                                    template_call.template_name.clone(),
+                                ),
+                            ));
+                        }
+                    };
 
                     // Get the corresponding value from JSON response
                     let value = match json {
                         JsonValue::Object(map) => {
                             map.get(&template_call.template_name).ok_or_else(|| {
-                                format!(
-                                    "Missing output for template call: {}",
-                                    template_call.template_name
+                                (
+                                    template_call.template_name.clone(),
+                                    None,
+                                    JsonValidationError::MissingTemplateResponse(
+                                        template_call.template_name.clone(),
+                                    ),
                                 )
                             })?
                         }
-                        _ => return Err("Expected object response from LLM".to_string()),
+                        _ => {
+                            return Err((
+                                template_call.template_name.clone(),
+                                None,
+                                JsonValidationError::ExpectedObject(),
+                            ))
+                        }
                     };
 
                     let template_output = &template.output;
-                    println!("Validating: {:?}", template_output.field_type);
-                    println!("Value: {:?}", value);
-                    template_output.field_type.validate_json(value)?;
+                    template_output
+                        .field_type
+                        .validate_json(value)
+                        .map_err(|e| (template_call.template_name.clone(), None, e))?;
                 }
                 MainStatement::Comment(_) => {}
 
@@ -525,18 +584,7 @@ impl<'a> WAILMainDef<'a> {
                     variable,
                     object_type,
                     ..
-                } => {
-                    // Get the corresponding value from JSON response
-                    let value = match json {
-                        JsonValue::Object(map) => map.get(variable).ok_or_else(|| {
-                            format!("Missing output for object instantiation: {}", variable)
-                        })?,
-                        _ => return Err("Expected object response from LLM".to_string()),
-                    };
-
-                    // Validate the value matches the object type
-                    // TODO: Look up object type definition and validate against it
-                }
+                } => {}
             }
         }
         Ok(())
@@ -591,13 +639,10 @@ impl<'a> WAILTemplateDef<'a> {
 
         for input in &self.inputs {
             let placeholder = format!("{{{{{}}}}}", input.name);
-            let object_ref_placeholder = format!("{{{{{}.", input.name);
 
             if !prompt.contains(&placeholder) && !object_instances.contains_key(&input.name) {
                 return Err(format!("Missing placeholder for input: {}", input.name));
             }
-
-            println!("Arguments: {:?}", arguments);
 
             if let Some(arguments) = arguments {
                 let argument = arguments.get(&input.name).unwrap();
@@ -674,7 +719,6 @@ impl<'a> WAILTemplateDef<'a> {
                     }
                 }
 
-                // Add general annotations
                 if !general_annotations.is_empty() {
                     param_info.push_str("\n# General:\n");
                     for annotation in &general_annotations {
@@ -739,12 +783,8 @@ impl<'a> WAILTemplateDef<'a> {
                     }
                 }
 
-                println!("Param info: {}", param_info);
-
                 prompt = prompt.replace(&placeholder, &param_info);
             }
-
-            println!("Prompt: {}", prompt);
         }
 
         // Handle return type with proper indentation
@@ -853,7 +893,7 @@ impl<'a> WAILTemplateDef<'a> {
                 .join("\n");
 
             let return_prompt = format!(
-                "\nAnswer using this schema:{}\nWrap your final result in <result> and </result> tags.",
+                "\nAnswer using this schema:\n{}\nWrap your final result in <result> and </result> tags.",
                 indented_schema
             );
 
@@ -866,7 +906,7 @@ impl<'a> WAILTemplateDef<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::wail_parser::WAILParser;
+    use crate::wail_parser::{WAILFileType, WAILParser};
 
     #[test]
     fn test_parse_llm_output() {
@@ -888,8 +928,11 @@ mod tests {
         }
     }"#;
 
-        let parser = WAILParser::new();
-        parser.parse_wail_file(wail_schema).unwrap();
+        let test_dir = std::env::current_dir().unwrap();
+        let parser = WAILParser::new(test_dir);
+        parser
+            .parse_wail_file(wail_schema.to_string(), WAILFileType::Application, true)
+            .unwrap();
 
         // Test relaxed JSON parsing features
         let cases = vec![

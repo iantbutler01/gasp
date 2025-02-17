@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
     Object(HashMap<String, JsonValue>),
     Array(Vec<JsonValue>),
@@ -58,10 +58,26 @@ impl fmt::Display for JsonValue {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Number {
     Integer(i64),
     Float(f64),
+}
+
+impl Number {
+    pub fn is_i64(&self) -> bool {
+        match self {
+            Self::Integer(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn as_i64(&self) -> i64 {
+        match self {
+            Self::Integer(i) => i.clone(),
+            _ => panic!("Tried to take float as integer."),
+        }
+    }
 }
 
 impl fmt::Display for Number {
