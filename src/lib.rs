@@ -67,6 +67,11 @@ impl WAILGenerator {
         }
     }
 
+    #[pyo3(text_signature = "(&self, base_dir)")]
+    fn set_base_dir(&mut self, base_dir: String) {
+        self.base_dir = PathBuf::from(base_dir);
+    }
+
     /// Load WAIL schema content
     #[pyo3(text_signature = "($self, content)")]
     fn load_wail(&mut self, content: String) -> PyResult<Option<Py<PyDict>>> {
@@ -86,6 +91,11 @@ impl WAILGenerator {
                 match e {
                     wail_parser::WAILParseError::UnexpectedToken { found, location } => {
                         py_dict.set_item("error_type", "UnexpectedToken")?;
+                        py_dict.set_item("found", found)?;
+                        py_dict.set_item("location", format!("{:?}", location))?;
+                    }
+                    wail_parser::WAILParseError::UnexpectedKeyword { found, location } => {
+                        py_dict.set_item("error_type", "UnexpectedKeyword")?;
                         py_dict.set_item("found", found)?;
                         py_dict.set_item("location", format!("{:?}", location))?;
                     }

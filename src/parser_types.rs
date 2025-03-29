@@ -2,6 +2,7 @@ use crate::json_types::{JsonValue, Number};
 use crate::types::*;
 use regex;
 use std::collections::HashMap;
+use std::env::var;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
