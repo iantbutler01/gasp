@@ -6,15 +6,28 @@ on:
 
 jobs:
   ##########################################
-  # 1) Ubuntu builds using cibuildwheel Docker (x64 + arm64)
+  # 1) Ubuntu builds using cibuildwheel Docker (x86_64 + arm64)
   ##########################################
   build-ubuntu:
     name: Build on Ubuntu (x86_64 + arm64)
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
-        arch: ["x86_64", "aarch64"]
+        include:
+          - python-version: "3.8"
+            arch: "x86_64"
+          - python-version: "3.9"
+            arch: "x86_64"
+          - python-version: "3.10"
+            arch: "x86_64"
+          - python-version: "3.11"
+            arch: "x86_64"
+          - python-version: "3.11"
+            arch: "aarch64"
+          - python-version: "3.12"
+            arch: "x86_64"
+          - python-version: "3.12"
+            arch: "aarch64"
       fail-fast: false
 
     steps:
