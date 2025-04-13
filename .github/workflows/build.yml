@@ -48,6 +48,11 @@ jobs:
           toolchain: stable
           override: true
 
+      - name: Set up QEMU for ARM builds
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
       - name: Build wheels
         run: |
           PYTHON_VERSION_NO_DOTS=$(echo '${{ matrix.python-version }}' | tr -d .)
