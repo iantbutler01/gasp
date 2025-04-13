@@ -35,6 +35,15 @@ pub enum WAILParseError {
         location: Location,
     },
 
+    SymbolNotFound {
+        name: String,
+    },
+
+    AmbiguousSymbol {
+        name: String,
+        matches: Vec<String>,
+    },
+
     // Static analysis errors
     UndefinedType {
         name: String,
@@ -130,40 +139,46 @@ pub struct WAILParser<'a> {
     import_chain: RefCell<ImportChain>,
     base_path: PathBuf,
     incremental_parser: RefCell<Option<Parser<'a>>>,
+    current_module: RefCell<Vec<String>>,
 }
 
 #[derive(Debug)]
 pub struct ImportChain {
-    // Track the chain of imports to detect cycles
-    chain: Vec<String>,
-    // Current working directory for resolving relative paths
+    // Stack of current import resolution
+    stack: Vec<String>,
+    // Set of all visited/imported files
+    visited: HashSet<String>,
+    // Base directory for resolving relative paths
     base_path: PathBuf,
 }
 
 impl ImportChain {
-    fn new(base_path: PathBuf) -> Self {
+    pub fn new(base_path: PathBuf) -> Self {
         Self {
-            chain: Vec::new(),
+            stack: Vec::new(),
+            visited: HashSet::new(),
             base_path,
         }
     }
 
-    fn push(&mut self, path: &str) -> Result<(), WAILParseError> {
+    pub fn push(&mut self, path: &str) -> Result<bool, WAILParseError> {
         let canonical_path = self.resolve_path(path)?;
 
-        if self.chain.contains(&canonical_path) {
+        if self.stack.contains(&canonical_path) {
             return Err(WAILParseError::CircularImport {
-                path: canonical_path,
-                chain: self.chain.clone(),
+                path: canonical_path.clone(),
+                chain: self.stack.clone(),
             });
         }
 
-        self.chain.push(canonical_path);
-        Ok(())
+        let is_new = self.visited.insert(canonical_path.clone());
+        self.stack.push(canonical_path);
+
+        Ok(is_new) // true = first time seen, false = already visited
     }
 
-    fn pop(&mut self) {
-        self.chain.pop();
+    pub fn pop(&mut self) {
+        self.stack.pop();
     }
 
     fn resolve_path(&self, path: &str) -> Result<String, WAILParseError> {
@@ -635,6 +650,7 @@ pub struct Parser<'a> {
     main: &'a RefCell<Option<WAILMainDef<'a>>>,
     import_chain: &'a RefCell<ImportChain>,
     in_prompt_block: RefCell<bool>,
+    current_module: &'a RefCell<Vec<String>>,
 }
 
 impl<'a> Parser<'a> {
@@ -648,6 +664,7 @@ impl<'a> Parser<'a> {
         object_instances: &'a RefCell<HashMap<String, WAILObjectInstantiation>>,
         main: &'a RefCell<Option<WAILMainDef<'a>>>,
         import_chain: &'a RefCell<ImportChain>,
+        current_module: &'a RefCell<Vec<String>>,
     ) -> Self {
         let mut tokenizer = Tokenizer::new(input);
         let current_token = tokenizer.next_token();
@@ -666,6 +683,7 @@ impl<'a> Parser<'a> {
             main,
             import_chain,
             in_prompt_block: RefCell::new(false),
+            current_module: current_module,
         }
     }
 
@@ -676,12 +694,14 @@ impl<'a> Parser<'a> {
         // Parse object name
         let name = self.expect_identifier()?;
 
-        // Check for duplicate definition
-        if self.registry.borrow().contains_key(name) {
-            return Err(WAILParseError::DuplicateDefinition {
-                name: name.to_string(),
-                location: self.tokenizer.last_location(),
-            });
+        let namespaced_id = self.namespaced_identifier(name.to_string());
+
+        {
+            if self.registry.borrow().contains_key(&namespaced_id) {
+                return Ok(WAILDefinition::Object(
+                    self.lookup_symbol_in_registry(&name)?.clone(),
+                ));
+            }
         }
 
         // Expect opening brace
@@ -784,8 +804,12 @@ impl<'a> Parser<'a> {
 
         let definition = WAILDefinition::Object(field.clone());
 
-        // Add object to registry
-        self.registry.borrow_mut().insert(name.to_string(), field);
+        let namespaced_id = self.namespaced_identifier(name.to_string());
+
+        {
+            // Add object to registry
+            self.registry.borrow_mut().insert(namespaced_id, field);
+        }
 
         Ok(definition)
     }
@@ -798,12 +822,15 @@ impl<'a> Parser<'a> {
         // Parse template name
         let name = self.expect_identifier()?;
 
-        // Check for duplicate definition
-        if self.template_registry.borrow().contains_key(name) {
-            return Err(WAILParseError::DuplicateDefinition {
-                name: name.to_string(),
-                location: self.tokenizer.last_location(),
-            });
+        let namespaced_id = self.namespaced_identifier(name.to_string());
+
+        {
+            // Check for duplicate definition
+            if self.template_registry.borrow().contains_key(&namespaced_id) {
+                return Ok(WAILDefinition::Template(
+                    self.lookup_template_in_registry(&name)?.clone(),
+                ));
+            }
         }
 
         // Expect opening parenthesis
@@ -886,10 +913,13 @@ impl<'a> Parser<'a> {
                     prompt_template,
                     annotations,
                 };
+
+                let namespaced_id = self.namespaced_identifier(name.to_string());
+
                 // Add to template registry
                 self.template_registry
                     .borrow_mut()
-                    .insert(name.to_string(), template_def.clone());
+                    .insert(namespaced_id, template_def.clone());
 
                 Ok(WAILDefinition::Template(template_def))
             }
@@ -899,20 +929,25 @@ impl<'a> Parser<'a> {
             }),
         }
     }
-
-    // Update the parse_wail_file method to handle whitespace better
     fn parse_wail_file(
         &mut self,
         file_type: WAILFileType,
     ) -> Result<Vec<WAILDefinition<'a>>, WAILParseError> {
         let mut definitions = Vec::new();
+        let mut imports = Vec::new();
 
         self.optional_whitespace();
 
         // Parse imports first
         while let Token::Keyword("import") = self.current_token {
             let import = self.parse_import()?;
+            imports.push(import.clone());
             definitions.push(import);
+        }
+
+        // Process imports after they're all parsed
+        if !imports.is_empty() {
+            self.resolve_imports(&imports)?;
         }
 
         // Parse regular definitions
@@ -962,6 +997,184 @@ impl<'a> Parser<'a> {
         Ok(definitions)
     }
 
+    fn resolve_imports(&mut self, imports: &[WAILDefinition<'a>]) -> Result<(), WAILParseError> {
+        for def in imports {
+            if let WAILDefinition::Import(import) = def {
+                // Resolve the import path
+                let file_path = self.import_chain.borrow().resolve_path(&import.path)?;
+                self.current_module.borrow_mut().push(import.path.clone());
+
+                // Check for circular imports
+                if let Err(e) = self.import_chain.borrow_mut().push(&file_path) {
+                    return Err(e);
+                }
+                // Read the file content
+                let lib_content =
+                    std::fs::read_to_string(&file_path).map_err(|e| WAILParseError::FileError {
+                        path: import.path.clone(),
+                        error: e.to_string(),
+                    })?;
+
+                // Make the string live for 'a lifetime
+                let lib_content = Box::leak(lib_content.into_boxed_str());
+
+                // Create a new parser for this import with the same shared state
+                let mut import_parser = Parser::new(
+                    lib_content,
+                    self.registry,
+                    self.template_registry,
+                    self.adhoc_obj_ref_id_counter,
+                    self.adhoc_obj_ids,
+                    self.adhoc_obj_refs,
+                    self.object_instances,
+                    self.main,
+                    self.import_chain,
+                    self.current_module,
+                );
+
+                // Parse the library file
+                let lib_defs = import_parser.parse_wail_file(WAILFileType::Library)?;
+
+                // Create a map of definitions from the library
+                let mut objects = HashMap::new();
+                for lib_def in &lib_defs {
+                    if let Some(name) = lib_def.get_name() {
+                        objects.insert(name.to_string(), lib_def.clone());
+                    }
+                }
+
+                // Process each requested item
+                for item_name in &import.items {
+                    let mut found = false;
+                    if let Some(lib_def) = objects.get(item_name) {
+                        found = true;
+
+                        // Add the definition to the appropriate registry
+                        match lib_def {
+                            WAILDefinition::Object(field) => {
+                                let namespaced_id = self.namespaced_identifier(field.name.clone());
+
+                                let mut reg_borrow = self.registry.borrow_mut();
+
+                                match reg_borrow.get(&namespaced_id) {
+                                    Some(_) => continue,
+                                    None => {
+                                        reg_borrow.insert(namespaced_id, field.clone());
+                                        drop(reg_borrow)
+                                    }
+                                }
+                            }
+                            WAILDefinition::Template(template) => {
+                                let namespaced_id =
+                                    self.namespaced_identifier(template.name.clone());
+                                let mut reg_borrow = self.template_registry.borrow_mut();
+
+                                match reg_borrow.get(&namespaced_id) {
+                                    Some(_) => continue,
+                                    None => {
+                                        reg_borrow.insert(namespaced_id, template.clone());
+                                        drop(reg_borrow)
+                                    }
+                                }
+                            }
+                            WAILDefinition::Union(field) => {
+                                let namespaced_id = self.namespaced_identifier(field.name.clone());
+                                let mut reg_borrow = self.registry.borrow_mut();
+
+                                match reg_borrow.get(&namespaced_id) {
+                                    Some(_) => continue,
+                                    None => {
+                                        reg_borrow.insert(namespaced_id, field.clone());
+                                        drop(reg_borrow)
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        // Also process referenced types
+                        match lib_def {
+                            WAILDefinition::Object(field) => {
+                                self.add_referenced_types(&field.field_type, &objects);
+                            }
+                            WAILDefinition::Template(template) => {
+                                for param in &template.inputs {
+                                    self.add_referenced_types(&param.field_type, &objects);
+                                }
+                                self.add_referenced_types(&template.output.field_type, &objects);
+                            }
+                            WAILDefinition::Union(field) => {
+                                self.add_referenced_types(&field.field_type, &objects);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !found {
+                        return Err(WAILParseError::ImportNotFound {
+                            name: item_name.clone(),
+                            path: import.path.clone(),
+                        });
+                    }
+                }
+
+                // Pop from import chain after processing
+                self.import_chain.borrow_mut().pop();
+                self.current_module.borrow_mut().pop();
+            }
+        }
+
+        Ok(())
+    }
+
+    // Helper method to add referenced types
+    fn add_referenced_types(
+        &self,
+        field_type: &WAILType<'a>,
+        objects: &HashMap<String, WAILDefinition<'a>>,
+    ) {
+        match field_type {
+            WAILType::Composite(composite) => match composite {
+                WAILCompositeType::Object(obj) => {
+                    let type_name = obj.type_data.type_name;
+
+                    {
+                        // If this type exists in objects map and not already in registry
+                        if objects.contains_key(type_name)
+                            && !self.registry.borrow().contains_key(type_name)
+                        {
+                            if let Some(WAILDefinition::Object(field)) = objects.get(type_name) {
+                                {
+                                    self.registry
+                                        .borrow_mut()
+                                        .insert(field.name.clone(), field.clone());
+                                }
+
+                                // Recursively add fields
+                                if let Some(fields) = &obj.type_data.field_definitions {
+                                    for field in fields {
+                                        self.add_referenced_types(&field.field_type, objects);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                WAILCompositeType::Array(array) => {
+                    if let Some(element_type) = &array.type_data.element_type {
+                        self.add_referenced_types(element_type, objects);
+                    }
+                }
+                WAILCompositeType::Union(union) => {
+                    for member in &union.members {
+                        self.add_referenced_types(&member.field_type, objects);
+                    }
+                }
+            },
+            _ => {} // Simple types don't reference other objects
+        }
+    }
+
     // Update other parsing methods that work with newlines and comments
     fn parse_field(&mut self) -> Result<WAILField<'a>, WAILParseError> {
         // Parse field name
@@ -983,6 +1196,84 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn lookup_template_in_registry(
+        &self,
+        name: &str,
+    ) -> Result<WAILTemplateDef<'a>, WAILParseError> {
+        let mut matches = vec![];
+
+        {
+            for (key, def) in self.template_registry.borrow().iter() {
+                if let Some(actual_name) = key.split('.').last() {
+                    if actual_name == name {
+                        matches.push((key.clone(), def.clone()));
+                    }
+                }
+            }
+        }
+
+        match matches.len() {
+            0 => Err(WAILParseError::SymbolNotFound {
+                name: name.to_string(),
+            }),
+            1 => Ok(matches.remove(0).1),
+            _ => Err(WAILParseError::AmbiguousSymbol {
+                name: name.to_string(),
+                matches: matches.into_iter().map(|(k, _)| k).collect(),
+            }),
+        }
+    }
+
+    fn lookup_adhoc_obj_in_registry(&self, name: &str) -> Result<WAILObject, WAILParseError> {
+        let mut matches = vec![];
+
+        {
+            for (key, def) in self.adhoc_obj_refs.borrow().iter() {
+                if let Some(actual_name) = key.split('.').last() {
+                    if actual_name == name {
+                        matches.push((key.clone(), def.clone()));
+                    }
+                }
+            }
+        }
+
+        match matches.len() {
+            0 => Err(WAILParseError::SymbolNotFound {
+                name: name.to_string(),
+            }),
+            1 => Ok(matches.remove(0).1),
+            _ => Err(WAILParseError::AmbiguousSymbol {
+                name: name.to_string(),
+                matches: matches.into_iter().map(|(k, _)| k).collect(),
+            }),
+        }
+    }
+
+    fn lookup_symbol_in_registry(&self, name: &str) -> Result<WAILField<'a>, WAILParseError> {
+        let mut matches = vec![];
+
+        {
+            for (key, def) in self.registry.borrow().iter() {
+                if let Some(actual_name) = key.split('.').last() {
+                    if actual_name == name {
+                        matches.push((key.clone(), def.clone()));
+                    }
+                }
+            }
+        }
+
+        match matches.len() {
+            0 => Err(WAILParseError::SymbolNotFound {
+                name: name.to_string(),
+            }),
+            1 => Ok(matches.remove(0).1.clone()),
+            _ => Err(WAILParseError::AmbiguousSymbol {
+                name: name.to_string(),
+                matches: matches.into_iter().map(|(k, _)| k).collect(),
+            }),
+        }
+    }
+
     fn parse_union(&mut self) -> Result<WAILDefinition<'a>, WAILParseError> {
         // Expect "union" keyword
         self.expect_keyword("union")?;
@@ -990,12 +1281,14 @@ impl<'a> Parser<'a> {
         // Parse union name
         let name = self.expect_identifier()?;
 
-        // Check for duplicate definition
-        if self.registry.borrow().contains_key(name) {
-            return Err(WAILParseError::DuplicateDefinition {
-                name: name.to_string(),
-                location: self.tokenizer.last_location(),
-            });
+        let namespaced_id = self.namespaced_identifier(name.to_string());
+
+        {
+            if self.registry.borrow().contains_key(&namespaced_id) {
+                return Ok(WAILDefinition::Object(
+                    self.lookup_symbol_in_registry(&name)?.clone(),
+                ));
+            }
         }
 
         // Expect equals sign
@@ -1069,10 +1362,12 @@ impl<'a> Parser<'a> {
             annotations: Vec::new(),
         };
 
+        let namespaced_id = self.namespaced_identifier(name.to_string());
+
         // Add to registry
         self.registry
             .borrow_mut()
-            .insert(name.to_string(), field.clone());
+            .insert(namespaced_id, field.clone());
 
         Ok(WAILDefinition::Union(field))
     }
@@ -1344,11 +1639,6 @@ impl<'a> Parser<'a> {
         // Parse path string
         let path = self.expect_string()?;
 
-        // Check for circular imports
-        if let Err(e) = self.import_chain.borrow_mut().push(path) {
-            return Err(e);
-        }
-
         Ok(WAILDefinition::Import(WAILImport {
             items: items.iter().map(|s| s.to_string()).collect(),
             path: path.to_string(),
@@ -1433,6 +1723,14 @@ impl<'a> Parser<'a> {
         self.create_type_value(base_type, is_array)
     }
 
+    fn namespaced_identifier(&self, id: String) -> String {
+        let module_prefix = self.current_module.borrow().last().cloned();
+        match module_prefix {
+            Some(prefix) => format!("{}.{}", prefix, id),
+            None => id.to_string(), // top-level file, no prefix
+        }
+    }
+
     fn parse_adhoc_object_type(&mut self) -> Result<WAILType<'a>, WAILParseError> {
         // Generate a unique ID for the adhoc object
         let adhoc_id = {
@@ -1499,9 +1797,11 @@ impl<'a> Parser<'a> {
             },
         };
 
+        let namespaced_id = self.namespaced_identifier(adhoc_id.clone());
+
         self.adhoc_obj_refs
             .borrow_mut()
-            .insert(adhoc_id.clone(), object.clone());
+            .insert(namespaced_id.clone(), object.clone());
 
         let field = WAILField {
             name: adhoc_id.clone(),
@@ -1511,7 +1811,7 @@ impl<'a> Parser<'a> {
 
         self.registry
             .borrow_mut()
-            .insert(adhoc_id.clone(), field.clone());
+            .insert(namespaced_id.clone(), field.clone());
 
         Ok(WAILType::Composite(WAILCompositeType::Object(object)))
     }
@@ -1553,11 +1853,11 @@ impl<'a> Parser<'a> {
                 },
             })),
             // For other types, check if it's registered or assume it's an object/custom type
-            _ => {
-                if let Some(field) = self.registry.borrow().get(type_name) {
-                    field.field_type.clone()
-                } else {
-                    WAILType::Composite(WAILCompositeType::Object(WAILObject {
+            _ => match self.lookup_symbol_in_registry(&type_name) {
+                Ok(field) => field.field_type.clone(),
+                Err(e) => match e {
+                    WAILParseError::AmbiguousSymbol { .. } => return Err(e),
+                    _ => WAILType::Composite(WAILCompositeType::Object(WAILObject {
                         value: HashMap::new(),
                         type_data: WAILTypeData {
                             json_type: JsonValue::Object(HashMap::new()),
@@ -1565,9 +1865,9 @@ impl<'a> Parser<'a> {
                             field_definitions: None,
                             element_type: None,
                         },
-                    }))
-                }
-            }
+                    })),
+                },
+            },
         };
 
         // Wrap in array if needed
@@ -1744,10 +2044,12 @@ impl<'a> Parser<'a> {
                     template_call.arguments.clone(),
                 )?;
 
+                let namespaced_id = self.namespaced_identifier(var_name.clone());
+
                 // Add to object instances
                 self.object_instances
                     .borrow_mut()
-                    .insert(var_name.clone(), obj_instantiation);
+                    .insert(namespaced_id.clone(), obj_instantiation);
 
                 return Ok(MainStatement::ObjectInstantiation {
                     variable: var_name,
@@ -1756,18 +2058,17 @@ impl<'a> Parser<'a> {
                 });
             }
         }
-
-        // If not an object instantiation, check if it's a template call
-        if !self
-            .template_registry
-            .borrow()
-            .contains_key(&template_call.template_name)
-        {
-            return Err(WAILParseError::InvalidTemplateCall {
-                template_name: template_call.template_name.clone(),
-                reason: format!("Template '{}' not found", template_call.template_name),
-                location: self.tokenizer.last_location(),
-            });
+        drop(registry);
+        match self.lookup_template_in_registry(&template_call.template_name) {
+            Err(WAILParseError::SymbolNotFound { .. }) => {
+                return Err(WAILParseError::InvalidTemplateCall {
+                    template_name: template_call.template_name.clone(),
+                    reason: format!("Template '{}' not found", template_call.template_name),
+                    location: self.tokenizer.last_location(),
+                });
+            }
+            Err(e) => return Err(e),
+            _ => (),
         }
 
         // Expect semicolon
@@ -1847,15 +2148,17 @@ impl<'a> Parser<'a> {
                 // Object reference or type reference
                 self.next_token();
 
-                // Check if it's an object instance reference
-                if self.object_instances.borrow().contains_key(name) {
-                    Ok(TemplateArgument::ObjectRef(name.to_string()))
-                } else if self.registry.borrow().contains_key(name) {
-                    // Check if it's a type reference
-                    Ok(TemplateArgument::TypeRef(name.to_string()))
-                } else {
-                    // Treat as a variable reference
-                    Ok(TemplateArgument::TemplateArgRef(name.to_string()))
+                {
+                    // Check if it's an object instance reference
+                    if self.object_instances.borrow().contains_key(name) {
+                        Ok(TemplateArgument::ObjectRef(name.to_string()))
+                    } else if self.registry.borrow().contains_key(name) {
+                        // Check if it's a type reference
+                        Ok(TemplateArgument::TypeRef(name.to_string()))
+                    } else {
+                        // Treat as a variable reference
+                        Ok(TemplateArgument::TemplateArgRef(name.to_string()))
+                    }
                 }
             }
             Token::String(s) => {
@@ -1886,6 +2189,7 @@ impl<'a> Parser<'a> {
         let field = match registry.get(object_type) {
             Some(f) => f,
             None => {
+                drop(registry);
                 return Err(WAILParseError::UndefinedType {
                     name: object_type.to_string(),
                     location: self.tokenizer.last_location(),
@@ -1916,12 +2220,14 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            drop(registry);
             Ok(WAILObjectInstantiation {
                 binding_name: name.to_string(),
                 object_type: object_type.to_string(),
                 fields: args,
             })
         } else {
+            drop(registry);
             Err(WAILParseError::InvalidTemplateCall {
                 template_name: object_type.to_string(),
                 reason: format!("{} is not an object type", object_type),
@@ -1944,6 +2250,7 @@ impl<'a> WAILParser<'a> {
             import_chain: RefCell::new(ImportChain::new(base_path.clone())),
             base_path: base_path.clone(),
             incremental_parser: RefCell::new(None),
+            current_module: RefCell::new(vec![]),
         }
     }
 
@@ -2008,6 +2315,7 @@ impl<'a> WAILParser<'a> {
             &self.object_instances,
             &self.main,
             &self.import_chain,
+            &self.current_module,
         )
     }
 
@@ -2022,10 +2330,10 @@ impl<'a> WAILParser<'a> {
         }
 
         // Find positions of `gasp` fence and JSON object in the input.
-        let result_pos = input.find("<result>");
+        let result_pos = input.find("<action>");
 
         match result_pos {
-            Some(_) => self.parse_result_block(input), // Only <result> block is present.
+            Some(_) => self.parse_result_block(input), // Only <action> block is present.
             None => Err(nom::Err::Error(nom::error::Error::new(
                 input,
                 nom::error::ErrorKind::Tag,
@@ -2033,11 +2341,11 @@ impl<'a> WAILParser<'a> {
         }
     }
 
-    /// Parse a <result></result> fenced block.
+    /// Parse a <action></action> fenced block.
     fn parse_result_block(&'a self, input: &'a str) -> IResult<&'a str, String> {
-        let (input, _) = take_until("<result>")(input)?;
+        let (input, _) = take_until("<action>")(input)?;
         let (input, content) =
-            delimited(tag("<result>"), take_until("</result>"), tag("</result>"))(input)?;
+            delimited(tag("<action>"), take_until("</action>"), tag("</action>"))(input)?;
 
         let content = content.trim();
         Ok((input, content.to_string()))
@@ -2125,9 +2433,12 @@ impl<'a> WAILParser<'a> {
                         matches.push(name.clone())
                     }
                 }
-                None => continue,
+                None => {
+                    continue;
+                }
             }
         }
+        drop(reg_borrow);
 
         if matches.len() > 1 || matches.len() == 0 {
             None
@@ -2183,6 +2494,7 @@ impl<'a> WAILParser<'a> {
             Some((PathSegment::UnionType(field, validation_errors), _)) => {
                 match json {
                     JsonValue::Object(map) => {
+                        println!("{:?}", map.keys());
                         // Try each possible union type and its validation errors
                         for (type_name, errors) in validation_errors {
                             // Clone the object to try fixes without modifying original
@@ -2193,6 +2505,7 @@ impl<'a> WAILParser<'a> {
 
                             // Try to fix the validation errors for this type
                             let res = self.fix_json_value(&mut test_json, &error_path);
+                            println!("{:?}", res);
                             if res.is_ok() {
                                 // If successful, apply the changes back to original
                                 *json = test_json;
@@ -2317,14 +2630,22 @@ impl<'a> WAILParser<'a> {
     }
 
     pub fn validate_and_fix(&self, json: &mut JsonValue) -> Result<(), String> {
+        let mut c = 0;
+
         loop {
             match self.validate_json(&json.to_string()) {
                 Ok(_) => return Ok(()),
                 Err((template, variable, err)) => {
+                    if c > 2 {
+                        return Ok(());
+                    }
+
                     let mut path = self.get_error_location(&err);
                     path.insert(0, PathSegment::Root((template, variable)));
 
                     self.fix_json_value(json, &path)?;
+
+                    c += 1;
                 }
             }
         }
@@ -2346,9 +2667,10 @@ impl<'a> WAILParser<'a> {
                     // Check if the element type exists if it's a custom type
                     if let Some(element_type) = &array.type_data.element_type {
                         let element_type_str = element_type.type_name().to_string();
+                        let namespaced_id = self.lookup_symbol_in_registry(&element_type_str);
                         if element_type_str != "String"
                             && element_type_str != "Number"
-                            && !registry.contains_key(&element_type_str)
+                            && namespaced_id.is_err()
                         {
                             // For array element types in templates, undefined types are errors
                             errors.push(ValidationError::UndefinedTypeInTemplate {
@@ -2396,10 +2718,8 @@ impl<'a> WAILParser<'a> {
                 }
                 WAILCompositeType::Object(object) => {
                     let type_name = object.type_data.type_name.to_string();
-                    if type_name != "String"
-                        && type_name != "Number"
-                        && !registry.contains_key(&type_name)
-                    {
+                    let namespaced_id = self.lookup_symbol_in_registry(&type_name);
+                    if type_name != "String" && type_name != "Number" && namespaced_id.is_err() {
                         // For return types and input parameters in templates, undefined types are errors
                         errors.push(ValidationError::UndefinedTypeInTemplate {
                             template_name: template_name.to_string(),
@@ -2440,6 +2760,83 @@ impl<'a> WAILParser<'a> {
         }
     }
 
+    fn lookup_template_in_registry(
+        &self,
+        name: &str,
+    ) -> Result<WAILTemplateDef<'a>, WAILParseError> {
+        let mut matches = vec![];
+
+        {
+            for (key, def) in self.template_registry.borrow().iter() {
+                if let Some(actual_name) = key.split('.').last() {
+                    if actual_name == name {
+                        matches.push((key.clone(), def.clone()));
+                    }
+                }
+            }
+        }
+
+        match matches.len() {
+            0 => Err(WAILParseError::SymbolNotFound {
+                name: name.to_string(),
+            }),
+            1 => Ok(matches.remove(0).1),
+            _ => Err(WAILParseError::AmbiguousSymbol {
+                name: name.to_string(),
+                matches: matches.into_iter().map(|(k, _)| k).collect(),
+            }),
+        }
+    }
+
+    fn lookup_adhoc_obj_in_registry(&self, name: &str) -> Result<WAILObject, WAILParseError> {
+        let mut matches = vec![];
+
+        {
+            for (key, def) in self.adhoc_obj_refs.borrow().iter() {
+                if let Some(actual_name) = key.split('.').last() {
+                    if actual_name == name {
+                        matches.push((key.clone(), def.clone()));
+                    }
+                }
+            }
+        }
+
+        match matches.len() {
+            0 => Err(WAILParseError::SymbolNotFound {
+                name: name.to_string(),
+            }),
+            1 => Ok(matches.remove(0).1),
+            _ => Err(WAILParseError::AmbiguousSymbol {
+                name: name.to_string(),
+                matches: matches.into_iter().map(|(k, _)| k).collect(),
+            }),
+        }
+    }
+
+    fn lookup_symbol_in_registry(&self, name: &str) -> Result<WAILField<'a>, WAILParseError> {
+        let mut matches = vec![];
+
+        {
+            for (key, def) in self.registry.borrow().iter() {
+                if let Some(actual_name) = key.split('.').last() {
+                    if actual_name == name {
+                        matches.push((key.clone(), def.clone()));
+                    }
+                }
+            }
+        }
+
+        match matches.len() {
+            0 => Err(WAILParseError::SymbolNotFound {
+                name: name.to_string(),
+            }),
+            1 => Ok(matches.remove(0).1.clone()),
+            _ => Err(WAILParseError::AmbiguousSymbol {
+                name: name.to_string(),
+                matches: matches.into_iter().map(|(k, _)| k).collect(),
+            }),
+        }
+    }
     pub fn validate(&self) -> (Vec<ValidationWarning>, Vec<ValidationError>) {
         let mut warnings = Vec::new();
         let mut errors = Vec::new();
@@ -2475,6 +2872,9 @@ impl<'a> WAILParser<'a> {
                 true,
             );
         }
+
+        drop(template_registry);
+        drop(registry);
 
         (warnings, errors)
     }
@@ -2527,142 +2927,7 @@ impl<'a> WAILParser<'a> {
         }
     }
 
-    fn resolve_imports(
-        &'a self,
-        definitions: &Vec<WAILDefinition<'a>>,
-    ) -> Result<(), WAILParseError> {
-        let mut all_imported_defs = vec![];
-
-        let saved_template_registry = self.template_registry.borrow_mut().clone();
-        let saved_instances = self.object_instances.borrow_mut().clone();
-        let saved_registry = self.registry.borrow_mut().clone();
-
-        for def in definitions {
-            if let WAILDefinition::Import(import) = def {
-                // Clean up import pollution since we use the same parser
-                self.object_instances.borrow_mut().clear();
-                self.registry.borrow_mut().clear();
-                self.template_registry.borrow_mut().clear();
-                // Load and parse the library file
-                let file_path = self.import_chain.borrow().resolve_path(&import.path)?;
-
-                let lib_content =
-                    std::fs::read_to_string(&file_path).map_err(|e| WAILParseError::FileError {
-                        path: import.path.clone(),
-                        error: e.to_string(),
-                    })?;
-
-                let file_type = WAILFileType::Library;
-
-                // Parse the library file
-                let lib_defs = self.parse_wail_file(lib_content, file_type, false)?;
-                let mut objects: HashMap<String, WAILDefinition> = HashMap::new();
-
-                for lib_def in &lib_defs {
-                    match lib_def {
-                        WAILDefinition::Object(field) => {
-                            objects.insert(field.name.clone(), lib_def.clone());
-                        }
-                        _ => continue,
-                    }
-                }
-
-                // Extract requested definitions
-                for item_name in &import.items {
-                    let mut found = false;
-                    for lib_def in &lib_defs {
-                        match lib_def {
-                            WAILDefinition::Object(field) if &field.name == item_name => {
-                                found = true;
-                                all_imported_defs.push(lib_def.clone());
-
-                                // Collect referenced objects
-                                self.collect_referenced_objects(
-                                    &field.field_type,
-                                    &objects,
-                                    &mut all_imported_defs,
-                                );
-                                break;
-                            }
-                            WAILDefinition::Template(template) if &template.name == item_name => {
-                                found = true;
-                                all_imported_defs.push(lib_def.clone());
-
-                                // Check input parameters
-                                for param in &template.inputs {
-                                    self.collect_referenced_objects(
-                                        &param.field_type,
-                                        &objects,
-                                        &mut all_imported_defs,
-                                    );
-                                }
-
-                                // Check return type
-                                self.collect_referenced_objects(
-                                    &template.output.field_type,
-                                    &objects,
-                                    &mut all_imported_defs,
-                                );
-                                break;
-                            }
-                            WAILDefinition::Union(field) if &field.name == item_name => {
-                                found = true;
-                                all_imported_defs.push(lib_def.clone());
-
-                                // Process union members and their referenced types
-                                self.collect_referenced_objects(
-                                    &field.field_type,
-                                    &objects,
-                                    &mut all_imported_defs,
-                                );
-                                break;
-                            }
-                            _ => continue,
-                        }
-                    }
-                    if !found {
-                        return Err(WAILParseError::ImportNotFound {
-                            name: item_name.clone(),
-                            path: import.path.clone(),
-                        });
-                    }
-                }
-            }
-        }
-        // One final clean up of import pollution since we use the same parser
-        self.object_instances.borrow_mut().clear();
-        self.registry.borrow_mut().clear();
-        self.template_registry.borrow_mut().clear();
-
-        self.object_instances.replace(saved_instances);
-        self.registry.replace(saved_registry);
-        self.template_registry.replace(saved_template_registry);
-
-        // This has to happen in two parts so we accumulate all defs first otherwise clearing would clobber.
-        for def in all_imported_defs {
-            match def {
-                WAILDefinition::Object(field) => {
-                    self.registry
-                        .borrow_mut()
-                        .insert(field.name.clone(), field.clone());
-                }
-                WAILDefinition::Template(template) => {
-                    self.template_registry
-                        .borrow_mut()
-                        .insert(template.name.clone(), template.clone());
-                }
-                WAILDefinition::Union(field) => {
-                    self.registry
-                        .borrow_mut()
-                        .insert(field.name.clone(), field.clone());
-                }
-                _ => continue,
-            }
-        }
-        Ok(())
-    }
     // Add this method to use our token-based parser
-
     pub fn parse_wail_file_with_tokens(
         &'a self,
         input_string: String,
@@ -2672,20 +2937,17 @@ impl<'a> WAILParser<'a> {
         let input: &str = Box::leak(Box::new(input_string));
 
         if clear {
-            self.registry.borrow_mut().clear();
-            self.template_registry.borrow_mut().clear();
-            self.main.borrow_mut().take();
-            self.object_instances.borrow_mut().clear();
-            self.adhoc_obj_ids.borrow_mut().clear();
-            self.adhoc_obj_refs.borrow_mut().clear();
+            self.registry.replace(HashMap::new());
+            self.template_registry.replace(HashMap::new());
+            self.main.take();
+            self.object_instances.replace(HashMap::new());
+            self.adhoc_obj_ids.replace(Vec::new());
+            self.adhoc_obj_refs.replace(HashMap::new());
         }
 
         let mut parser = self.incremental_parser(input);
 
         let definitions = parser.parse_wail_file(file_type)?;
-
-        // Process imports
-        self.resolve_imports(&definitions)?;
 
         Ok(definitions)
     }
@@ -3492,9 +3754,9 @@ Return in this format: {{return_type}}"#
         // Test gasp fence parsing
         let gasp_fence = r#"
    Some text before
-   <result>
+   <action>
    "hello"
-   </result>
+   </action>
    Some text after
    "#;
 
@@ -3519,13 +3781,13 @@ Return in this format: {{return_type}}"#
         // Test multiple gasp fences
         let multiple_fences = r#"
          First result:
-         <result>
+         <action>
          "hello"
-         </result>
+         </action>
          Second result:
-         <result>
+         <action>
          "world"
-         </result>
+         </action>
          "#;
 
         let res = parser.parse_llm_output(multiple_fences);
@@ -3535,12 +3797,12 @@ Return in this format: {{return_type}}"#
         // Test mixed traditional and fence
         let mixed = r#"
          Fence:
-         <result>
+         <action>
          "world"
-         </result>
-         <result>
+         </action>
+         <action>
          "world"
-         </result>
+         </action>
          dd
          "#;
         let res = parser.parse_llm_output(mixed);
@@ -3562,9 +3824,9 @@ Return in this format: {{return_type}}"#
             .unwrap();
 
         let number_fence = r#"
-        <result>
+        <action>
          43
-        </result>
+        </action>
          "#;
 
         let res = parser.parse_llm_output(number_fence);
@@ -3585,9 +3847,9 @@ Return in this format: {{return_type}}"#
             .unwrap();
 
         let array_fence = r#"
-         <result>
+         <action>
          [1, 2, 3]
-         </result>
+         </action>
          "#;
         let res = parser.parse_llm_output(array_fence);
         println!("{:?}", res);
@@ -3851,7 +4113,7 @@ main {
     #[test]
     fn test_parse_imports() {
         let input = r#"
-    import { Person, Address } from "types.lib.wail"
+    import { Person, Address, Thing } from "types.lib.wail"
     import { GetPerson } from "templates.lib.wail"
 
     object Config {
@@ -3878,6 +4140,8 @@ main {
             object Address {
                 street: String
             }
+
+            union Thing = Person | Address;
         "#,
         )
         .unwrap();
@@ -3902,7 +4166,7 @@ main {
         println!("{:?}", definitions);
         match &definitions[0] {
             WAILDefinition::Import(import) => {
-                assert_eq!(import.items, vec!["Person", "Address"]);
+                assert_eq!(import.items, vec!["Person", "Address", "Thing"]);
                 assert_eq!(import.path, "types.lib.wail");
             }
             _ => panic!("Expected first definition to be import"),
@@ -3922,26 +4186,37 @@ main {
         let test_dir = std::env::current_dir().unwrap();
         let parser = WAILParser::new(test_dir);
 
-        // Test duplicate object definition
+        // Test duplicate object definition (first wins)
         let input = r#"
-      object Person {
-            name: String
-      }
-      object Person {
-            age: Number
-      }
-      main {
-            prompt { }
-      }
-      "#;
+object Person {
+    name: String
+}
+object Person {
+    age: Number
+}
+main {
+    prompt { }
+}
+"#;
 
-        let err = parser
+        let _result = parser
             .parse_wail_file(input.to_string(), WAILFileType::Application, true)
-            .unwrap_err();
-        assert!(
-            matches!(err, WAILParseError::DuplicateDefinition { name, .. } if name == "Person")
-        );
+            .unwrap();
 
+        // Ensure the first definition was used
+        let registry = parser.registry.borrow();
+        let person = registry.get("Person").expect("Person not found");
+
+        if let WAILType::Composite(WAILCompositeType::Object(obj)) = &person.field_type {
+            let fields = obj.type_data.field_definitions.as_ref().unwrap();
+            let field_names: Vec<_> = fields.iter().map(|f| f.name.as_str()).collect();
+            assert!(field_names.contains(&"name"));
+            assert!(!field_names.contains(&"age")); // second definition was ignored
+        } else {
+            panic!("Person should be an object type");
+        }
+
+        drop(registry);
         // Test missing main block
         let input = r#"
       object Person {
@@ -3952,6 +4227,8 @@ main {
         let err = parser
             .parse_wail_file(input.to_string(), WAILFileType::Application, true)
             .unwrap_err();
+
+        println!("HERER");
         assert!(matches!(err, WAILParseError::MissingMainBlock));
 
         // Test unexpected token
@@ -3980,5 +4257,213 @@ main {
         //     let err = parser.parse_wail_file(input).unwrap_err();
         //     println!("{:?}", err);
         //     assert!(matches!(err, WAILParseError::UnexpectedEOF { .. }));
+    }
+    #[test]
+    fn test_resolve_imports_comprehensive() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+
+        // Create types.lib.wail with objects and a union
+        fs::write(
+            tmp.path().join("types.lib.wail"),
+            r#"
+        object Person {
+            name: String
+            age: Number
+        }
+        
+        object Address {
+            street: String
+            city: String
+            country: String
+        }
+        
+        union ContactInfo = Person | Address;
+        "#,
+        )
+        .unwrap();
+
+        // Create templates.lib.wail with templates that use the types
+        fs::write(
+            tmp.path().join("templates.lib.wail"),
+            r#"
+        import { Person, Address, ContactInfo } from "types.lib.wail"
+        
+        template GetPerson(name: String, age: Number) -> Person {
+            prompt: """
+            Create a person with name {{name}} and age {{age}}.
+            {{return_type}}
+            """
+        }
+        
+        template GetContactInfo(info: String) -> ContactInfo {
+            prompt: """
+            Parse this info: {{info}}
+            Return in this format: {{return_type}}
+            """
+        }
+        "#,
+        )
+        .unwrap();
+
+        // Create nested.lib.wail that imports from templates.lib.wail
+        fs::write(
+            tmp.path().join("nested.lib.wail"),
+            r#"
+        import { GetPerson } from "templates.lib.wail"
+        
+        object ExtendedPerson {
+            person: Person
+            notes: String
+        }
+        "#,
+        )
+        .unwrap();
+
+        // Create main file that imports from all libraries
+        let input = r#"
+    import { Person, ContactInfo } from "types.lib.wail"
+    import { GetContactInfo } from "templates.lib.wail"
+    import { ExtendedPerson } from "nested.lib.wail"
+    
+    main {
+        let person_info = GetContactInfo(info: "John Doe, 30 years old");
+        
+        prompt {
+            Parse this information: {{person_info}}
+        }
+    }
+    "#;
+
+        let parser = WAILParser::new(tmp.path().to_path_buf());
+        let result = parser.parse_wail_file(input.to_string(), WAILFileType::Application, true);
+        assert!(
+            result.is_ok(),
+            "Failed to parse imports: {:?}",
+            result.err()
+        );
+
+        // Verify all types were imported correctly
+        let registry = parser.registry.borrow();
+        let template_registry = parser.template_registry.borrow();
+
+        println!("{:?}", registry.keys());
+
+        // Check objects
+        assert!(
+            registry.contains_key("types.lib.wail.Person"),
+            "Person object not imported"
+        );
+        assert!(
+            registry.contains_key("types.lib.wail.ContactInfo"),
+            "ContactInfo union not imported"
+        );
+        assert!(
+            registry.contains_key("nested.lib.wail.ExtendedPerson"),
+            "ExtendedPerson not imported"
+        );
+
+        // Check that Person has the right fields
+        if let WAILType::Composite(WAILCompositeType::Object(obj)) =
+            &registry.get("types.lib.wail.Person").unwrap().field_type
+        {
+            let fields = obj.type_data.field_definitions.as_ref().unwrap();
+            assert_eq!(fields.len(), 3); // name, age, _type
+
+            let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+            assert!(field_names.contains(&"name".to_string()));
+            assert!(field_names.contains(&"age".to_string()));
+        } else {
+            panic!("Person should be an object type");
+        }
+
+        // Check that ContactInfo is a union with Person and Address
+        if let WAILType::Composite(WAILCompositeType::Union(union)) = &registry
+            .get("types.lib.wail.ContactInfo")
+            .unwrap()
+            .field_type
+        {
+            assert_eq!(union.members.len(), 2);
+
+            // Verify the union members (could be in any order)
+            let member_types: Vec<String> = union
+                .members
+                .iter()
+                .map(|m| match &m.field_type {
+                    WAILType::Composite(WAILCompositeType::Object(obj)) => {
+                        obj.type_data.type_name.to_string()
+                    }
+                    _ => "unknown".to_string(),
+                })
+                .collect();
+
+            assert!(
+                member_types.contains(&"Person".to_string()),
+                "Union doesn't contain Person"
+            );
+            assert!(
+                member_types.contains(&"Address".to_string()),
+                "Union doesn't contain Address"
+            );
+        } else {
+            panic!("ContactInfo should be a union type");
+        }
+
+        // Check that ExtendedPerson references Person
+        if let WAILType::Composite(WAILCompositeType::Object(obj)) = &registry
+            .get("nested.lib.wail.ExtendedPerson")
+            .unwrap()
+            .field_type
+        {
+            let fields = obj.type_data.field_definitions.as_ref().unwrap();
+            assert_eq!(fields.len(), 3); // person, notes, _type
+
+            // Check that person field is of type Person
+            let person_field = fields
+                .iter()
+                .find(|f| f.name == "person")
+                .expect("No person field found");
+            if let WAILType::Composite(WAILCompositeType::Object(pers_obj)) =
+                &person_field.field_type
+            {
+                assert_eq!(pers_obj.type_data.type_name, "Person");
+            } else {
+                panic!("person field should be of type Person");
+            }
+        } else {
+            panic!("ExtendedPerson should be an object type");
+        }
+
+        // Check templates
+        assert!(
+            template_registry.contains_key("templates.lib.wail.GetContactInfo"),
+            "GetContactInfo template not imported"
+        );
+
+        assert!(
+            !template_registry.contains_key("GetPerson"),
+            "GetPerson template should not be imported directly"
+        );
+
+        // Check that GetContactInfo returns ContactInfo
+        let template = template_registry
+            .get("templates.lib.wail.GetContactInfo")
+            .unwrap();
+
+        println!("{:?}", template.output.field_type);
+        if let WAILType::Composite(WAILCompositeType::Union(_)) = &template.output.field_type {
+            // Good, it's a union
+        } else {
+            panic!("GetContactInfo should return a union type");
+        }
+
+        // Check import chain was handled correctly
+        let import_chain = parser.import_chain.borrow();
+        assert!(
+            import_chain.stack.is_empty(),
+            "Import stack should be empty after parsing"
+        );
     }
 }

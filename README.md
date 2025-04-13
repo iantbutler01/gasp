@@ -90,13 +90,13 @@ print(prompt)
 # Use your favorite LLM client to send the prompt and get a response
 # response = your_fav_client.generate(prompt) # or whatever your interface is
 examples_res = """
-<result>
+<action>
 {
     name: "Alice",
     "age": 25,
     "interests": [coding, 'AI', "music"]
 }
-</result>
+</action>
 """
 
 # Parse and validate JSON responses
@@ -189,7 +189,7 @@ def main():
     # In a real application, you would send this prompt to your LLM
     # Here we'll simulate an LLM response with some typical quirks
     llm_response = """
-    <result>
+    <action>
     {
         'name': 'Alice',
         'age': 25,
@@ -199,7 +199,7 @@ def main():
             hiking,
         ]
     }
-    </result>
+    </action>
     """
 
     try:

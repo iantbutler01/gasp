@@ -127,6 +127,15 @@ impl WAILGenerator {
                         py_dict.set_item("path", path)?;
                         py_dict.set_item("chain", chain)?;
                     }
+                    wail_parser::WAILParseError::AmbiguousSymbol { name, matches } => {
+                        py_dict.set_item("error_type", "AmbiguousSymbol")?;
+                        py_dict.set_item("name", name)?;
+                        py_dict.set_item("matches", matches)?;
+                    }
+                    wail_parser::WAILParseError::SymbolNotFound { name } => {
+                        py_dict.set_item("error_type", "SymbolNotFound")?;
+                        py_dict.set_item("name", name)?;
+                    }
                     wail_parser::WAILParseError::InvalidImportPath { path, error } => {
                         py_dict.set_item("error_type", "InvalidImportPath")?;
                         py_dict.set_item("path", path)?;
@@ -480,9 +489,9 @@ mod tests {
                 .unwrap();
 
             let valid_success = r#"
-            <result>
+            <action>
             {"message": "ok", "_type": "Success"}
-            </result>
+            </action>
             "#;
             let res = parser.parse_llm_output(valid_success);
             assert!(res.is_ok());
@@ -491,16 +500,16 @@ mod tests {
             let res2 = parser.validate_json(&val.to_string());
             assert!(res2.is_ok());
 
-            let valid_error = r#"<result>
+            let valid_error = r#"<action>
             {"code": 404, "_type": "Code"}
-            </result>"#;
+            </action>"#;
             let res = parser.parse_llm_output(valid_error);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_ok());
 
-            let invalid = r#"<result>
+            let invalid = r#"<action>
             {"code": "404", "_type": "Code"}
-            </result>"#;
+            </action>"#;
             let res = parser.parse_llm_output(invalid);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_err());
@@ -528,17 +537,17 @@ mod tests {
                 .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
                 .unwrap();
 
-            let valid_success = r#"<result>{"message": "ok", "_type": "Success"}</result>"#;
+            let valid_success = r#"<action>{"message": "ok", "_type": "Success"}</action>"#;
             let res = parser.parse_llm_output(valid_success);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_ok());
 
-            let valid_error = r#"<result>{"code": 404, "_type": "Error"}</result>"#;
+            let valid_error = r#"<action>{"code": 404, "_type": "Error"}</action>"#;
             let res = parser.parse_llm_output(valid_error);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_ok());
 
-            let invalid = r#"<result>{"code": "404", "_type": "Error"}</result>"#;
+            let invalid = r#"<action>{"code": "404", "_type": "Error"}</action>"#;
             let res = parser.parse_llm_output(invalid);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_err());
@@ -566,18 +575,18 @@ mod tests {
                 .parse_wail_file(schema.to_string(), WAILFileType::Application, true)
                 .unwrap();
 
-            let valid = r#"<result>[
+            let valid = r#"<action>[
                {"message": "ok", "_type": "Success"},
                {"code": 404, "_type": "Error"}
-           ]</result>"#;
+           ]</action>"#;
             let res = parser.parse_llm_output(valid);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_ok());
 
-            let invalid = r#"<result>[
+            let invalid = r#"<action>[
                {"message": "ok", "_type": "Success"},
                {"code": "404", "_type": "Error"}
-           ]</result>"#;
+           ]</action>"#;
             let res = parser.parse_llm_output(invalid);
             assert!(res.is_ok());
             assert!(parser.validate_json(&res.unwrap().to_string()).is_err());
@@ -610,10 +619,10 @@ mod tests {
             .unwrap();
 
         let result = r#"
-        <result>
+        <action>
             {"message": 123},
             {"code": "404", "details": "error"}
-</result>
+</action>
         "#;
 
         let mut json = parser.parse_llm_output(&result).unwrap();

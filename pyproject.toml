@@ -9,7 +9,7 @@ strip = true
 
 [project]
 name = "gasp-py"
-version = "0.9.0"
+version = "0.10.0"
 description = "GASP (Gee Another Schema Parser) - A validator for WAIL (Widely Applicable Interface Language) schemas and JSON"
 authors = [{ name = "Ian Butler", email = "ian@bismuth.cloud" }]
 requires-python = ">=3.7"

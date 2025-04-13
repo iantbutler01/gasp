@@ -894,7 +894,7 @@ impl<'a> WAILTemplateDef<'a> {
                 .join("\n");
 
             let return_prompt = format!(
-                "\nAnswer using this schema:\n{}\nWrap your final result in <result> and </result> tags.",
+                "\nAnswer using this schema:\n{}\nWrap your action block in <action> and </action> tags.",
                 indented_schema
             );
 
@@ -938,13 +938,13 @@ mod tests {
         // Test relaxed JSON parsing features
         let cases = vec![
             // Unquoted keys
-            r#"<result>{"person": {name: "Alice", age: 25, interests: ["coding"]}}</result>"#,
+            r#"<action>{"person": {name: "Alice", age: 25, interests: ["coding"]}}</action>"#,
             // Single quotes
-            r#"<result>{'person': {'name': 'Alice', 'age': 25, 'interests': ['coding']}}</result>"#,
+            r#"<action>{'person': {'name': 'Alice', 'age': 25, 'interests': ['coding']}}</action>"#,
             // Trailing commas
-            r#"<result>{"person": {"name": "Alice", "age": 25, "interests": ["coding",],}}</result>"#,
+            r#"<action>{"person": {"name": "Alice", "age": 25, "interests": ["coding",],}}</action>"#,
             // Mixed quotes and unquoted identifiers
-            r#"<result>{"person": {name: 'Alice', "age": 25, interests: ["coding"]}}</result>"#,
+            r#"<action>{"person": {name: 'Alice', "age": 25, interests: ["coding"]}}</action>"#,
         ];
 
         for case in cases {
