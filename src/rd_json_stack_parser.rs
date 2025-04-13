@@ -560,6 +560,10 @@ impl Parser {
             b'u' => {
                 println!("Unicode escape");
                 self.pos += 1;
+                // Check if we have enough bytes for a Unicode escape sequence
+                if self.pos + 4 > self.container.len() {
+                    return Err(JsonError::InvalidEscape);
+                }
                 let hex = std::str::from_utf8(&self.container[self.pos..self.pos + 4])
                     .map_err(|_| JsonError::InvalidEscape)?;
                 println!("Unicode sequence: {}", hex);
@@ -941,6 +945,10 @@ impl Parser {
                         }
                         b'u' => {
                             self.pos += 1;
+                            // Check if we have enough bytes for a Unicode escape sequence
+                            if self.pos + 4 > self.container.len() {
+                                return Err(JsonError::InvalidEscape);
+                            }
                             let hex = std::str::from_utf8(&self.container[self.pos..self.pos + 4])
                                 .map_err(|_| JsonError::InvalidEscape)?;
                             let code = u16::from_str_radix(hex, 16)
