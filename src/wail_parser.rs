@@ -83,8 +83,45 @@ impl std::fmt::Display for WAILParseError {
             WAILParseError::CircularImport { path, chain } => {
                 write!(f, "Circular import detected: {} in chain {:?}", path, chain)
             }
-            // ... handle other variants ...
-            _ => write!(f, "{:?}", self),
+            WAILParseError::UnexpectedToken { found, location } => {
+                write!(f, "Unexpected token '{}' at {}", found, location)
+            }
+            WAILParseError::UnexpectedKeyword { found, location } => {
+                write!(f, "Unexpected keyword '{}' at {}", found, location)
+            }
+            WAILParseError::UnexpectedEOF { expected, location } => {
+                write!(f, "Unexpected end of file, expected {} at {}", expected, location)
+            }
+            WAILParseError::InvalidIdentifier { found, location } => {
+                write!(f, "Invalid identifier '{}' at {}", found, location)
+            }
+            WAILParseError::SymbolNotFound { name } => {
+                write!(f, "Symbol not found: {}", name)
+            }
+            WAILParseError::AmbiguousSymbol { name, matches } => {
+                write!(f, "Ambiguous symbol '{}', could be any of: {:?}", name, matches)
+            }
+            WAILParseError::UndefinedType { name, location } => {
+                write!(f, "Undefined type '{}' at {}", name, location)
+            }
+            WAILParseError::DuplicateDefinition { name, location } => {
+                write!(f, "Duplicate definition of '{}' at {}", name, location)
+            }
+            WAILParseError::MissingMainBlock => {
+                write!(f, "Missing main block")
+            }
+            WAILParseError::InvalidTemplateCall { template_name, reason, location } => {
+                write!(f, "Invalid template call to '{}': {} at {}", template_name, reason, location)
+            }
+            WAILParseError::InvalidImportPath { path, error } => {
+                write!(f, "Invalid import path '{}': {}", path, error)
+            }
+            WAILParseError::FileError { path, error } => {
+                write!(f, "File error for '{}': {}", path, error)
+            }
+            WAILParseError::ImportNotFound { name, path } => {
+                write!(f, "Import '{}' not found in '{}'", name, path)
+            }
         }
     }
 }
@@ -2395,6 +2432,9 @@ impl<'a> WAILParser<'a> {
         &self,
         json: &str,
     ) -> Result<(), (String, Option<String>, JsonValidationError)> {
+        // Use the incremental JsonParser which is already stack-safe
+        // The rd_json_stack_parser::Parser is an incremental parser that doesn't use recursion
+        // This prevents stack overflow issues with deeply nested JSON
         let mut parser = JsonParser::new(json.as_bytes().to_vec());
         let value = parser.parse().map_err(|e| {
             (
