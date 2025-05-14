@@ -6,13 +6,18 @@ build-backend = "maturin"
 bindings = "pyo3"
 compatibility = "linux"
 strip = true
+include = ["gasp/*.py"]
+module-name = "gasp.gasp"
 
 [project]
 name = "gasp-py"
-version = "0.10.1"
-description = "GASP (Gee Another Schema Parser) - A validator for WAIL (Widely Applicable Interface Language) schemas and JSON"
-authors = [{ name = "Ian Butler", email = "ian@bismuth.cloud" }]
+version = "1.0.0"
+description = "GASP (Gee Another Schema Parser) - A validator and type safe deserializer for LLM output."
+authors = [{ name = "Ian Butler", email = "ian@bismuth.sh" }]
 requires-python = ">=3.7"
+dependencies = [
+    "jinja2>=3.0.0"
+]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",

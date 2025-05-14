@@ -1,18 +1,8 @@
-// Copyright 2024 The Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use std::collections::HashMap;
 use std::fmt;
+
+use crate::json_tok::Kind;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
     Object(HashMap<String, JsonValue>),
@@ -102,14 +92,10 @@ pub enum JsonError {
     DuplicateKey(String),
     UnexpectedChar(char),
     UnexpectedEof,
+    EOF,
     InvalidNumber(String),
-    UnmatchedBrace,
-    UnmatchedBracket,
-    ExpectedColon,
-    ExpectedComma,
     InvalidEscape,
-    InvalidString,
-    ReservedKeyword(String),
+    InvalidKey,
 }
 
 impl fmt::Display for JsonError {
@@ -156,5 +142,84 @@ impl JsonValue {
 
     pub fn is_null(&self) -> bool {
         matches!(self, JsonValue::Null)
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Generic “key” helper                                              */
+/* ------------------------------------------------------------------ */
+
+/// Anything that can address a child inside a `JsonValue`.
+///
+/// * `&str`  → object key  
+/// * `usize` → array index
+pub trait JsonIndex {
+    fn at(self, parent: &JsonValue) -> Option<&JsonValue>;
+}
+
+impl<'a> JsonIndex for &str {
+    fn at(self, parent: &JsonValue) -> Option<&JsonValue> {
+        match parent {
+            JsonValue::Object(map) => map.get(self),
+            _ => None,
+        }
+    }
+}
+impl<'a> JsonIndex for usize {
+    fn at(self, parent: &JsonValue) -> Option<&JsonValue> {
+        match parent {
+            JsonValue::Array(arr) => arr.get(self),
+            _ => None,
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Accessor                                                          */
+/* ------------------------------------------------------------------ */
+
+impl JsonValue {
+    /// Borrow a child value by object key or array index.
+    ///
+    /// ```
+    /// let v = JsonValue::Object(...);
+    /// if let Some(name) = v.get("name") { … }
+    /// ```
+    pub fn get<K>(&self, key: K) -> Option<&JsonValue>
+    where
+        K: JsonIndex,
+    {
+        key.at(self)
+    }
+
+    pub fn get_mut<'a>(&'a mut self, key: &str) -> Option<&'a mut JsonValue> {
+        match self {
+            JsonValue::Object(map) => map.get_mut(key),
+            _ => None,
+        }
+    }
+
+    // ── NEW: mutable index lookup on arrays ─────────────────────────
+    pub fn get_idx_mut<'a>(&'a mut self, idx: usize) -> Option<&'a mut JsonValue> {
+        match self {
+            JsonValue::Array(vec) => vec.get_mut(idx),
+            _ => None,
+        }
+    }
+}
+
+use std::ops::Index;
+
+impl Index<&str> for JsonValue {
+    type Output = JsonValue;
+    fn index(&self, key: &str) -> &Self::Output {
+        self.get(key).expect("object key not found")
+    }
+}
+
+impl Index<usize> for JsonValue {
+    type Output = JsonValue;
+    fn index(&self, idx: usize) -> &Self::Output {
+        self.get(idx).expect("array index out of bounds")
     }
 }

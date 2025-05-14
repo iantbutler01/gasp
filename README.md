@@ -1,42 +1,44 @@
-# GASP (Gee Another Schema Parser)
+# GASP - Type-Safe LLM Output Parser
 
-GASP is a high-performance Rust-based parser and validator for WAIL (Widely Applicable Interface Language) schemas and JSON responses. It's specifically designed to work with Large Language Models (LLMs) by providing robust error recovery for common LLM response quirks.
+> **⚠️ MAJOR BREAKING CHANGES IN VERSION 1.0.0 ⚠️**  
+> Version 1.0.0 is a complete rewrite that removes WAIL entirely and introduces a new tag-based parsing approach.  
+> If you're using an older version of GASP, you'll need to significantly change your code to upgrade.  
+> See the [Migration Guide](#migrating-from-pre-10-versions) below.
 
-## What is WAIL?
+GASP is a Rust-based parser for turning LLM outputs into properly typed Python objects. It handles streaming JSON fragments, recovers from common LLM quirks, and makes structured data extraction actually pleasant.
 
-WAIL (Widely Applicable Interface Language) is a schema language designed for:
-1. Generating type-validated LLM prompts
-2. Validating JSON responses from LLMs
-3. Providing clear error messages for schema violations
+## The Problem
 
-## Why
+LLMs are great at generating structured data when asked, but not perfect:
 
-In our experience the ergonomics around tool calling kind of suck right now and in the lowest common denominator settings are down right painful.
+```
+<Person>
+{
+  "name": "Alice Smith",
+  "age": 30,
+  hobbies: ["coding", "hiking"]
+}
+</Person>
+```
 
-If you're using OpenRouter (which is great) they choose not to support some platform specific features (understandable) like the "ANY" parameter from Anthropic so you wind up with super verbose output, the occasional no tool call, missing params even when specified in "required" and so we decided to implement this prompt creator and schema validator because what are tool calls other than type interfaces. 
+That output has unquoted keys, inconsistent formatting, and is embedded in natural language. Most JSON parsers just give up.
 
-Honestly, [BAML](https://github.com/BoundaryML/baml) is a really sick tool and more feature complete than this, with like people actually paid to work on it. However, they require you to use their code gen'd inference clients for sending messages to the LLM. That let's them do some really powerful things like validation mid streaming, but you have to be all in on them.
+## How GASP Works
 
-GASP and WAIL let you separate out prompt creation, inference and prompt validation from one another so you can apply GASP to whatever client floats your boat with the trade off that we aren't intending to make this work for every streaming format under the sun (at least I'm not, feel free to contribute!) so it's only applicable to fully generated outputs.
+GASP uses a tag-based approach to extract and type-cast structured data:
 
-I didn't need all that especially because I along with my friend and co-founder have written [Asimov](https://github.com/BismuthCloud/asimov/tree/main) a framework for building Agents that includes all of our own inference machinery I'm not looking to give up.
-
-Anyway both Asimov and now GASP/WAIL are built for supporting [Bismuth](https://waitlist.bismuth.sh) a programming agent that can help businesses find and patch bugs on your Github PRs before you ever know about them. 
+1. Tags like `<Person>...</Person>` mark where the structured data lives (and what type it is)
+2. The parser ignores everything outside those tags
+3. Inside the tags, it handles messy JSON with broken quotes, trailing commas, etc.
+4. The data gets converted into proper Python objects based on type annotations
 
 ## Features
 
-- **Robust Error Recovery**: Handles common LLM response issues like trailing commas, unquoted identifiers, and malformed JSON
-- **Type Coercion**: Attempt to fix type mismatches like Number -> String, single items to arrays, object types if a unique set of fields can be matched to a schema.
-- **Type Validation**: Strong type checking for both schema definitions and JSON responses
-- **High Performance**: Written in Rust with Python bindings for optimal speed
-- **Developer Friendly**: Clear error messages (except for syntax errors see below) and intuitive schema syntax
-- **LLM-Optimized**: Specifically designed to work with the quirks and inconsistencies of LLM outputs
-
-## Anti-Features
-- **Limited syntax error messages** - Right now syntax errors will tell you where the parser failed but messages aren't more helpful than that so sometimes it's hard to figure out what is wrong in the parser syntax.
-
-## Caveats
-- **Output parsing is assumed to be sequential** - That is we assume output happens in the same order as the template variable binding so like if binding1 doesn't correspond to output1 things will be wacky.
+- **Tag-Based Extraction**: Extract structured data even when surrounded by explanatory text
+- **Streaming Support**: Process data incrementally as it arrives from the LLM
+- **Type Inference**: Automatically match JSON objects to Python classes
+- **Error Recovery**: Handle common JSON mistakes that LLMs make
+- **Pydantic Integration**: Works with Pydantic for validation and schema definition
 
 ## Installation
 
@@ -44,232 +46,249 @@ Anyway both Asimov and now GASP/WAIL are built for supporting [Bismuth](https://
 pip install gasp-py
 ```
 
-## Usage
+## Quick Example
 
 ```python
-from gasp import WAILGenerator
+from gasp import Parser, Deserializable
+from typing import List, Optional
 
-# Create a validator with your WAIL schema
-generator = WAILGenerator()
+class Address(Deserializable):
+    street: str
+    city: str
+    zip_code: str
 
-schema = r'''
-object Response {
-    name: String
-    age: Number
-    interests: String[]
-}
+class Person(Deserializable):
+    name: str
+    age: int
+    address: Address
+    hobbies: Optional[List[str]] = None
 
-template GenerateResponse(desc: String) -> Response {
-    prompt: """
-    Based on {{desc}} generate a response that returns 
-    
-    {{return_type}}      
-    """
-}
+# Create a parser for the Person type
+parser = Parser(Person)
 
-main {
-    template_args {
-        desc: String
-    }
+# Process LLM output chunks as they arrive
+chunks = [
+    '<Person>{"name": "Alice", "age": 30',
+    ', "address": {"street": "123 Main St", "city": "Springfield"',
+    ', "zip_code": "12345"}, "hobbies": ["reading", "coding"]}</Person>'
+]
 
-    let res = GenerateResponse(desc: $desc);
+for chunk in chunks:
+    result = parser.feed(chunk)
+    print(result)  # Will show partial objects as they're built
 
-    prompt {
-        {{res}}
-    }
-}
-'''
-
-generator.load_wail(schema)
-
-# Get the prompt to send to the LLM
-(prompt, warnings, errors) = generator.get_prompt(desc="A totally good response")
-
-print(prompt)
-
-# Use your favorite LLM client to send the prompt and get a response
-# response = your_fav_client.generate(prompt) # or whatever your interface is
-examples_res = """
-<action>
-{
-    name: "Alice",
-    "age": 25,
-    "interests": [coding, 'AI', "music"]
-}
-</action>
-"""
-
-# Parse and validate JSON responses
-generator.parse_llm_output(examples_res)
-
-# Note the ability to handle malformed JSON
+# Get the final validated result
+person = parser.validate()
+print(f"Hello {person.name}!")  # Hello Alice!
 ```
 
-## Error Recovery
+## Working with Pydantic
 
-GASP includes built-in error recovery for common LLM response issues:
-- Trailing commas in arrays and objects
-- Unquoted identifiers in object keys
-- Missing quotes around strings
-- Inconsistent whitespace and formatting
+GASP integrates seamlessly with Pydantic:
 
-## License
+```python
+from pydantic import BaseModel
+from gasp import Parser
 
-Apache License, Version 2.0 - see LICENSE file for details.
+class UserProfile(BaseModel):
+    username: str
+    email: str
+    is_active: bool = True
+
+# Create parser from Pydantic model
+parser = Parser.from_pydantic(UserProfile)
+
+# Feed LLM output with tags
+llm_output = '<UserProfile>{"username": "alice42", "email": "alice@example.com"}</UserProfile>'
+result = parser.feed(llm_output)
+
+# Access as a proper Pydantic object
+profile = UserProfile.model_validate(parser.validate())
+print(profile.model_dump_json(indent=2))
+```
+
+## How Tags Work
+
+The tag name directly indicates what Python type to instantiate:
+
+```
+<Person>{ ... JSON data ... }</Person>  # Creates a Person instance
+<List>[ ... array data ... ]</List>     # Creates a List
+<Address>{ ... address data ... }</Address>  # Creates an Address
+```
+
+The parser ignores everything outside of the tags, so the LLM can provide explanations, context, or other text alongside the structured data.
+
+## Advanced Templating with Jinja2
+
+GASP provides built-in Jinja2 integration for more advanced prompt templating:
+
+```python
+from gasp import Deserializable, render_template
+from typing import List, Optional
+
+class Person(Deserializable):
+    """Information about a person"""
+    name: str
+    age: int
+    hobbies: Optional[List[str]] = None
+
+# Create a template with Jinja2 syntax
+template = """
+# {{ title }}
+
+Generate a {{ type_name|type_description }}.
+
+{% if include_format_instructions %}
+Your response must be formatted as:
+{{ person_type|format_type }}
+{% endif %}
+"""
+
+# Provide template context
+context = {
+    'title': 'Person Generator',
+    'type_name': Person,
+    'include_format_instructions': True,
+    'person_type': Person
+}
+
+# Render the template
+prompt = render_template(template, context)
+```
+
+### Available Jinja2 Filters
+
+- `format_type`: Generates format instructions for a type (e.g., `{{ my_type|format_type }}`)
+- `type_description`: Provides a human-readable description of a type, including docstring info
+
+### Template Files & Inheritance
+
+You can also use template files with inheritance:
+
+```python
+from gasp import render_file_template
+
+# Renders a template file with GASP filters included
+prompt = render_file_template("templates/person_prompt.j2", context)
+```
+
+### Direct Jinja2 Access
+
+For advanced cases, you can use the Jinja2 environment directly:
+
+```python
+from gasp.jinja_helpers import create_type_environment
+
+# Create a Jinja2 environment with GASP filters
+env = create_type_environment()
+
+# Add your own filters
+env.filters["my_filter"] = my_filter_function
+
+# Load templates from a directory
+env.loader = jinja2.FileSystemLoader("templates/")
+
+# Use directly with Jinja2 API
+template = env.get_template("my_template.j2")
+prompt = template.render(**context)
+```
+
+## Customizing Behavior
+
+Need more control? You can customize type conversion, validation, and parsing behavior:
+
+```python
+# Custom type conversions and validation
+class CustomPerson(Deserializable):
+    name: str
+    age: int
+
+    @classmethod
+    def __gasp_from_partial__(cls, partial_data):
+        """Add custom validation or pre-processing"""
+        # Normalize name to title case
+        if "name" in partial_data:
+            partial_data["name"] = partial_data["name"].title()
+        return super().__gasp_from_partial__(partial_data)
+```
+
+## Migrating from pre-1.0 Versions
+
+Version 1.0.0 represents a complete architectural shift:
+
+### What's Been Removed
+
+- **WAIL Parser**: The entire WAIL language and validation system has been removed
+- **Schema Validation**: The schema-based approach has been replaced with typed parsing
+- **WAILGenerator**: This class and its API are no longer available
+- All WAIL-related files and examples
+
+### What's New
+
+- **Tag-Based Parsing**: Uses XML-like tags in LLM output to identify data types
+- **Type Annotations**: Direct use of Python type annotations to define structures
+- **Template Helpers**: Functions to generate format instructions from types
+- **Streaming Support**: Improved support for processing data as it arrives
+
+### Migration Steps
+
+1. Replace WAIL schema definitions with Python classes using type annotations
+2. Replace `WAILGenerator` with the new `Parser` class
+3. Update your prompts to use the new tag-based format
+4. Use `template_helpers.interpolate_prompt()` to generate type-aware prompts
+
+Example of old WAIL approach:
+```python
+schema = r'''
+object Response { name: String, age: Number }
+template GenerateResponse() -> Response { ... }
+'''
+generator = WAILGenerator()
+generator.load_wail(schema)
+(prompt, _, _) = generator.get_prompt()
+llm_response = your_llm_client.generate(prompt)
+parsed_data = generator.parse_llm_output(llm_response)
+```
+
+New approach:
+```python
+from gasp import Deserializable, Parser
+from gasp.template_helpers import interpolate_prompt
+
+class Person(Deserializable):
+    name: str
+    age: int
+
+# Create a template with a {{return_type}} placeholder
+template = """
+Generate a profile for a person who loves coding.
+
+{{return_type}}
+"""
+
+# Generate a complete prompt with type information
+prompt = interpolate_prompt(template, Person)
+print(prompt)
+# Output will include:
+# Your response should be formatted as:
+# <Person>{ "name": string, "age": number }</Person>
+
+# Send to your LLM
+llm_response = your_llm_client.generate(prompt)
+
+# Parse the tagged response
+parser = Parser(Person)
+parser.feed(llm_response)
+person = parser.validate()
+
+print(f"Created person: {person.name}, {person.age} years old")
+```
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions welcome! Check out the examples directory to see how things work.
 
-## Complete Example
+## License
 
-Here's a complete example showing how to use GASP in Python:
-
-```python
-from gasp import WAILGenerator
-import json
-
-def create_person_prompt():
-    """Define the WAIL schema for person generation."""
-    return r'''
-    # Define our Person type
-    object Person {
-        name: String
-        age: Number
-        interests: String[]
-    }
-
-    # Define a template for generating a person from a description
-    template GetPersonFromDescription(description: String) -> Person {
-        prompt: """
-        Given this description of a person: "{{description}}"
-
-        Create a Person object with their name, age, and interests.
-        Return in this format: 
-        {{return_type}}
-        """
-    }
-
-    main {
-        # This is a comment
-        let person_prompt = GetPersonFromDescription(
-            description: "Alice is a 25-year-old software engineer who loves coding, AI, and hiking."
-        );
-
-        # This is the prompt we'll send to the LLM
-        prompt {
-            This is an example of a prompt generated by WAIL:
-            {{person_prompt}}
-        }
-    }
-    '''
-
-def main():
-    # Initialize our validator with the schema
-    generator = WAILGenerator()
-    generator.load_wail(create_person_prompt())
-
-    warnings, errors = generator.validate_wail()
-
-    print("Validation Results:")
-    print("\nWarnings:")
-    print(warnings)
-    print("\nErrors:")
-    print(errors)
-
-    # Get the generated prompt - this is what you'd send to your LLM
-    (prompt, warnings, errors) = generator.get_prompt()
-    print("Generated Prompt:")
-    print(prompt)
-    print("Warnings:")
-    print(warnings)
-    print("Errors:")
-    print(errors)
-
-    # In a real application, you would send this prompt to your LLM
-    # Here we'll simulate an LLM response with some typical quirks
-    llm_response = """
-    <action>
-    {
-        'name': 'Alice',
-        'age': 25,
-        'interests': [
-            "coding",
-            'AI',
-            hiking,
-        ]
-    }
-    </action>
-    """
-
-    try:
-        # Validate the LLM's response and get the parsed JSON as a Python dict
-        result = generator.parse_llm_output(llm_response)
-        print("✓ Response validation successful!")
-
-        result = result["person_prompt"]
-        
-
-        # Work with the validated data
-        print("\nParsed Person:")
-        print(f"Name: {result['name']}")
-        print(f"Age: {result['age']}")
-        print(f"Interests: {', '.join(result['interests'])}")
-        
-        # # You can also convert it to standard JSON
-        # print("\nAs standard JSON:")
-        # print(json.dumps(result, indent=2))
-        
-    except Exception as e:
-        print(f"❌ Validation error: {e}")
-
-if __name__ == "__main__":
-    main() 
-```
-
-This example demonstrates:
-1. Creating a WAIL schema with proper Python string formatting
-2. Defining object types and templates in WAIL
-3. Generating a type-aware prompt for your LLM
-4. Handling common LLM response quirks automatically
-5. Validating and parsing the response
-6. Working with the validated data in Python
-
-When run, this script will output:
-```
-Validation Results:
-Warnings:
-[]
-Errors:
-[]
-Generated Prompt:
-
-This is an example of a prompt generated by WAIL:
-
-Given this description of a person: "Alice is a 25-year-old software engineer who loves coding, AI, and hiking."
-
-Create a Person object with their name, age, and interests.
-Return in this format: 
-
-{
-  name: string
-  age: number
-  interests: String[]>
-}
-
-
-Warnings:
-[]
-Errors:
-[]
-✓ Response validation successful!
-
-Parsed Person:
-Name: Alice
-Age: 25
-Interests: coding, AI, hiking
-```
-
-## Changelog
-
-0.9.0 - Complete parser rewrite to an incremental non recursive parser. All original tests pass but parsing semantics may be slightly different. Considering this a breaking change because there are likely parser edge cases I can't account for.
+Apache License, Version 2.0
