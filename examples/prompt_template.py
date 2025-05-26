@@ -28,46 +28,79 @@ class ErrorResponse(Deserializable):
 # Define a union type (can return either a Person or an ErrorResponse)
 ResponseType = Union[Person, ErrorResponse]
 
+# Define more complex types to demonstrate enhanced structure examples
+class Company(Deserializable):
+    """Information about a company"""
+    name: str
+    industry: str
+    founded_year: int
+    headquarters: Address
+    employees: List[Person]  # List of complex objects
+
 def main():
     # Create a prompt template with {{return_type}} placeholder
     # Note: We're using a raw string to avoid escaping issues
-    description = "John is a 35-year-old software engineer living in Seattle who enjoys hiking and coding."
+    description = "Acme Corp is a technology company founded in 2010, headquartered in San Francisco, with several employees including John (35, engineer) and Sarah (42, designer)."
     
     prompt_template = f"""
-    Create a profile for a person based on this description:
+    Create a profile for a company based on this description:
     "{description}"
     
     {{{{return_type}}}}
     """
     
     # Interpolate the type information into the prompt
-    prompt = interpolate_prompt(prompt_template, Person, format_tag="return_type")
+    # This will now include structure examples for complex nested types
+    prompt = interpolate_prompt(prompt_template, Company, format_tag="return_type")
     
-    print("GENERATED PROMPT:")
-    print("=" * 40)
+    print("ENHANCED FORMAT INSTRUCTIONS WITH STRUCTURE EXAMPLES:")
+    print("=" * 60)
     print(prompt)
-    print("=" * 40)
+    print("=" * 60)
+    
+    print("\nNotice how the format instructions now include:")
+    print("1. Descriptive format for lists of complex objects")
+    print("2. Structure examples for each complex type")
+    print("3. A reminder to use valid JSON format")
     
     # In a real application, you would send this prompt to an LLM
-    # Here we'll simulate an LLM response
+    # Here we'll simulate an LLM response for a Company
     
     llm_response = """
-    I've created a profile based on your description:
+    Here's the company profile based on your description:
     
-    <Person>
+    <Company>
     {
-      "name": "John Smith",
-      "age": 35,
-      "address": {
-        "street": "123 Pine Street",
-        "city": "Seattle",
-        "zip_code": "98101"
+      "name": "Acme Corp",
+      "industry": "Technology",
+      "founded_year": 2010,
+      "headquarters": {
+        "street": "123 Market Street",
+        "city": "San Francisco",
+        "zip_code": "94105"
       },
-      "hobbies": ["hiking", "coding", "reading tech blogs"]
+      "employees": [
+        {
+          "name": "John Doe",
+          "age": 35,
+          "address": {
+            "street": "456 Pine St",
+            "city": "San Francisco",
+            "zip_code": "94102"
+          }
+        },
+        {
+          "name": "Sarah Smith",
+          "age": 42,
+          "address": {
+            "street": "789 Oak St",
+            "city": "San Francisco",
+            "zip_code": "94103"
+          }
+        }
+      ]
     }
-    </Person>
-    
-    Let me know if you need any other information about this person!
+    </Company>
     """
     
     print("\nSIMULATED LLM RESPONSE:")
@@ -76,28 +109,40 @@ def main():
     print("=" * 40)
     
     # Parse the LLM response
-    parser = Parser(Person)
+    parser = Parser(Company)
     
     # Process the LLM response in chunks (simulating streaming)
     chunks = [llm_response[i:i+50] for i in range(0, len(llm_response), 50)]
     
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks[:5]):  # Show just the first few chunks to keep output manageable
         result = parser.feed(chunk)
         if result:
-            print(f"\nParsed partial result: {result.__dict__ if hasattr(result, '__dict__') else result}")
+            print(f"\nChunk {i+1} partial result: {type(result).__name__} object")
+    
+    # Feed the rest silently
+    for chunk in chunks[5:]:
+        parser.feed(chunk)
     
     # Get the final validated result
-    person = parser.validate()
+    company = parser.validate()
     
     print("\nFINAL PARSED RESULT:")
     print("=" * 40)
-    if person:
-        print(f"Name: {person.name}")
-        print(f"Age: {person.age}")
-        print(f"City: {person.address.city}")
-        print(f"Hobbies: {', '.join(person.hobbies)}")
+    if company:
+        print(f"Company: {company.name}")
+        print(f"Industry: {company.industry}")
+        print(f"Founded: {company.founded_year}")
+        print(f"Headquarters: {company.headquarters.city}, {company.headquarters.zip_code}")
+        print(f"Number of employees: {len(company.employees)}")
+        print(f"Employees:")
+        
+        # Convert employee dictionaries to Person objects
+        for emp_dict in company.employees:
+            # Use __gasp_from_partial__ to convert dictionary to Person object
+            emp = Person.__gasp_from_partial__(emp_dict)
+            print(f"  - {emp.name}, {emp.age}")
     else:
-        print("No valid person data found in response.")
+        print("No valid company data found in response.")
     
 if __name__ == "__main__":
     main()

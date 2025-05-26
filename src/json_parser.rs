@@ -2,7 +2,7 @@ use crate::json_tok::{Kind, Tok, Tokenizer};
 use crate::json_types::{JsonError, JsonValue, Number};
 use crate::tag_finder::{TagEvent, TagFinder};
 use std::collections::{HashMap, HashSet};
-use std::default;
+use std::{default, vec};
 
 use crate::json_sax_scanner::{Event, Scanner, Step as ScanStep};
 
@@ -649,18 +649,20 @@ pub struct StreamParser {
     inner: Parser,
     done: bool,
     wanted: HashSet<String>,
+    ignored: HashSet<String>,
 }
 
 impl default::Default for StreamParser {
     fn default() -> Self {
-        Self::new(vec![])
+        Self::new(vec![], vec![])
     }
 }
 
 impl StreamParser {
-    pub fn new(tags: Vec<String>) -> Self {
+    pub fn new(tags: Vec<String>, ignored: Vec<String>) -> Self {
         Self {
             wanted: tags.into_iter().collect(),
+            ignored: ignored.into_iter().collect(),
             tagger: TagFinder::new(),
             inner: Parser::new(true), // keeps its own scanner
             done: false,
@@ -681,39 +683,46 @@ impl StreamParser {
         self.tagger.push(chunk, |ev| {
             match ev {
                 TagEvent::Open(name) => {
-                    self.capturing = self.wanted.is_empty()           // accept all
-                        || self.wanted.contains(name.as_str()); // accept selected
+                    // Only start capturing if the tag matches one of our wanted tags
+                    // or if we're accepting all tags (wanted is empty)
+                    self.capturing = self.wanted.is_empty() || self.wanted.contains(name.as_str());
+
                     if self.capturing {
+                        // If we're capturing, reset the inner parser
                         self.inner = Parser::new(true);
                     }
                     Ok(())
                 }
                 TagEvent::Bytes(bytes) => {
-                    let parse_res = self.inner.parse(bytes.as_bytes().to_vec());
+                    // Only process bytes if we're capturing
+                    if self.capturing {
+                        let parse_res = self.inner.parse(bytes.as_bytes().to_vec());
 
-                    match parse_res {
-                        Ok(JsonValue::Array(arr)) => {
-                            if arr.len() == 1 {
-                                latest = Some(arr.into_iter().next().unwrap());
-                            } else {
-                                latest = Some(JsonValue::Array(arr));
+                        match parse_res {
+                            Ok(JsonValue::Array(arr)) => {
+                                if arr.len() == 1 {
+                                    latest = Some(arr.into_iter().next().unwrap());
+                                } else {
+                                    latest = Some(JsonValue::Array(arr));
+                                }
                             }
+                            Ok(v) => latest = Some(v),
+                            Err(e) => return Err(e),
                         }
-                        Ok(v) => latest = Some(v),
-                        Err(e) => return Err(e),
                     }
-
-                    Ok(()) // placeholder
-                }
-                TagEvent::Close(name) if self.capturing => {
-                    if self.wanted.is_empty() || self.wanted.contains(name.as_str()) {
-                        latest = Some(self.inner.builder.finish(true)?);
-                        self.done = true;
-                    }
-                    self.capturing = false;
                     Ok(())
                 }
-                _ => Ok(()),
+                TagEvent::Close(name) => {
+                    // Only process close tag if we're capturing and the tag matches
+                    if self.capturing
+                        && (self.wanted.is_empty() || self.wanted.contains(name.as_str()))
+                    {
+                        latest = Some(self.inner.builder.finish(true)?);
+                        self.done = true;
+                        self.capturing = false;
+                    }
+                    Ok(())
+                }
             }
         })?;
         Ok(latest)
@@ -1490,5 +1499,141 @@ mod tests {
 
         /* ── 5. grab the final value (empty chunk → None, but we expect Some) ─ */
         // let final_val = end_val.unwrap();
+    }
+
+    #[test]
+    fn test_llm_token_fragmentation() {
+        // This test replicates the exact token fragmentation patterns we see from LLM outputs
+        // Where tags and JSON elements are split in unusual places
+
+        // Create a parser that's looking for ReportSubsystems tags
+        let mut parser = StreamParser::new(vec!["ReportSubsystems".to_string()], vec![]);
+
+        // Add debug logging to track the parsing process
+        println!("\nTesting LLM token fragmentation:");
+
+        // These fragments simulate the actual LLM output observed
+        let fragments = [
+            // Opening tag split across tokens
+            "<Report",
+            "Sub",
+            "systems>",
+            // JSON content split across tokens
+            "{",
+            "  \"",
+            "subsystems",
+            "\":",
+            " [",
+            "    {",
+            "      \"",
+            "name",
+            "\": \"",
+            "Core Engine",
+            "\",",
+            "      \"",
+            "files",
+            "\": [",
+            "        \"",
+            "packages/core/src/",
+            "\"",
+            "      ]",
+            "    }",
+            "  ]",
+            "}",
+            // Closing tag split across tokens
+            "</Report",
+            "Sub",
+            "systems>",
+        ];
+
+        let mut results = Vec::new();
+
+        // Process each fragment
+        for (i, fragment) in fragments.iter().enumerate() {
+            println!("Fragment {}: '{}'", i, fragment);
+            if let Some(result) = parser.step(fragment).unwrap() {
+                println!("  Got result: {:?}", result);
+                results.push(result);
+            } else {
+                println!("  No result from this fragment");
+            }
+        }
+
+        // Verify we got a final result
+        assert!(parser.is_done(), "Parser did not complete processing");
+        assert!(
+            !results.is_empty(),
+            "No results were produced from the fragments"
+        );
+
+        // Verify the final result structure
+        let final_result = results.last().unwrap();
+        if let JsonValue::Object(map) = final_result {
+            assert!(
+                map.contains_key("subsystems"),
+                "Missing 'subsystems' key in result"
+            );
+
+            // Verify the subsystems array exists and contains at least one item
+            if let Some(JsonValue::Array(subsystems)) = map.get("subsystems") {
+                assert!(!subsystems.is_empty(), "Subsystems array is empty");
+
+                // Check the first subsystem has name and files
+                if let Some(JsonValue::Object(subsystem)) = subsystems.first() {
+                    assert!(
+                        subsystem.contains_key("name"),
+                        "Subsystem missing 'name' key"
+                    );
+                    assert!(
+                        subsystem.contains_key("files"),
+                        "Subsystem missing 'files' key"
+                    );
+                } else {
+                    panic!("First subsystem is not an object");
+                }
+            } else {
+                panic!("'subsystems' is not an array");
+            }
+        } else {
+            panic!("Expected Object result, got: {:?}", final_result);
+        }
+    }
+
+    #[test]
+    fn test_extreme_tag_fragmentation() {
+        // This test replicates an even more extreme fragmentation pattern where
+        // the opening tag is broken into individual parts with spaces
+
+        // Create a parser that's looking for ReportSubsystems tags
+        let mut parser = StreamParser::new(vec!["ReportSubsystems".to_string()], vec![]);
+
+        println!("\nTesting extreme tag fragmentation - single character tokens:");
+
+        // EXACTLY as observed in the real output:
+        let fragments = [
+            // Opening tag completely broken up
+            " <",
+            "ReportSub",
+            "systems> tag",
+            // Simple JSON content
+            "{\"test\": true}</ReportSubsystems>",
+        ];
+
+        // Process each fragment
+        for (i, fragment) in fragments.iter().enumerate() {
+            println!("LLM output: {}", fragment);
+            let result = parser.step(fragment).unwrap();
+            if result.is_some() {
+                println!("Parser result: {:?}", result.unwrap());
+            } else {
+                println!("Parser result: None");
+            }
+        }
+
+        // Verify the parser completed
+        assert!(
+            parser.is_done(),
+            "Parser should be done after all fragments"
+        );
     }
 }
