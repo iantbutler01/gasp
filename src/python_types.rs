@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyType};
+use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 
 use crate::json_types::{JsonValue, Number};
@@ -12,6 +12,7 @@ pub enum PyTypeKind {
     Float,
     Boolean,
     List,
+    Tuple,
     Dict,
     Optional,
     Union,
@@ -75,29 +76,6 @@ impl PyTypeInfo {
         self
     }
 
-    /// Get the most specific type for this field
-    pub fn get_most_specific_type(&self) -> PyTypeKind {
-        if self.is_optional {
-            if self.args.len() == 1 {
-                return self.args[0].get_most_specific_type();
-            }
-            return PyTypeKind::Any;
-        }
-
-        match self.kind {
-            PyTypeKind::Union => {
-                if self.args.is_empty() {
-                    PyTypeKind::Any
-                } else {
-                    // For now, just return the first type in the union
-                    // More sophisticated union handling would go here
-                    self.args[0].get_most_specific_type()
-                }
-            }
-            _ => self.kind.clone(),
-        }
-    }
-
     /// Check if a JsonValue matches this type
     pub fn matches(&self, value: &JsonValue) -> bool {
         match (&self.kind, value) {
@@ -117,6 +95,26 @@ impl PyTypeInfo {
                     } else {
                         false
                     }
+                }
+            }
+            (PyTypeKind::Tuple, JsonValue::Array(_)) => {
+                // Tuples are represented as arrays in JSON
+                if self.args.is_empty() {
+                    true
+                } else if let JsonValue::Array(arr) = value {
+                    // For homogeneous tuples (Tuple[int, ...]) check all elements
+                    if self.args.len() == 1 {
+                        arr.iter().all(|item| self.args[0].matches(item))
+                    } else {
+                        // For fixed tuples (Tuple[str, int, bool]) check each position
+                        arr.len() == self.args.len()
+                            && arr
+                                .iter()
+                                .zip(&self.args)
+                                .all(|(item, expected_type)| expected_type.matches(item))
+                    }
+                } else {
+                    false
                 }
             }
             (PyTypeKind::Dict, JsonValue::Object(_)) => {
@@ -220,6 +218,49 @@ impl PyTypeInfo {
             None
         };
 
+        // Special handling for typing constructs that might not have __origin__ in some Python versions
+        // Check the string representation first
+        let repr_str = py_type.repr()?.extract::<String>()?;
+        if repr_str.starts_with("typing.List[") || repr_str.starts_with("list[") {
+            // Get type arguments
+            let type_args = if let Ok(args) = py_type.getattr("__args__") {
+                let args_seq = args.extract::<Vec<&PyAny>>()?;
+                let mut type_infos = Vec::new();
+                for arg in args_seq {
+                    type_infos.push(PyTypeInfo::extract_from_python(arg)?);
+                }
+                type_infos
+            } else {
+                Vec::new()
+            };
+
+            return Ok(PyTypeInfo::new(PyTypeKind::List, "list".to_string())
+                .with_module("typing".to_string())
+                .with_origin("list".to_string())
+                .with_args(type_args)
+                .with_py_type(py_type_ref));
+        }
+
+        if repr_str.starts_with("typing.Tuple[") || repr_str.starts_with("tuple[") {
+            // Get type arguments
+            let type_args = if let Ok(args) = py_type.getattr("__args__") {
+                let args_seq = args.extract::<Vec<&PyAny>>()?;
+                let mut type_infos = Vec::new();
+                for arg in args_seq {
+                    type_infos.push(PyTypeInfo::extract_from_python(arg)?);
+                }
+                type_infos
+            } else {
+                Vec::new()
+            };
+
+            return Ok(PyTypeInfo::new(PyTypeKind::Tuple, "tuple".to_string())
+                .with_module("typing".to_string())
+                .with_origin("tuple".to_string())
+                .with_args(type_args)
+                .with_py_type(py_type_ref));
+        }
+
         // Check if this is a typing module construct (List, Dict, Optional, etc.)
         if let Ok(origin) = py_type.getattr("__origin__") {
             let origin_name = origin.str()?.extract::<String>()?;
@@ -237,9 +278,23 @@ impl PyTypeInfo {
             };
 
             // Handle specific typing constructs
-            match origin_name.as_str() {
+            // Strip module prefix if present
+            let base_origin = if let Some(pos) = origin_name.rfind('.') {
+                &origin_name[pos + 1..]
+            } else {
+                &origin_name
+            };
+
+            match base_origin {
                 "list" => {
                     return Ok(PyTypeInfo::new(PyTypeKind::List, "list".to_string())
+                        .with_module(module_name.unwrap_or_else(|| "builtins".to_string()))
+                        .with_origin(origin_name)
+                        .with_args(type_args)
+                        .with_py_type(py_type_ref));
+                }
+                "tuple" => {
+                    return Ok(PyTypeInfo::new(PyTypeKind::Tuple, "tuple".to_string())
                         .with_module(module_name.unwrap_or_else(|| "builtins".to_string()))
                         .with_origin(origin_name)
                         .with_args(type_args)
@@ -253,6 +308,24 @@ impl PyTypeInfo {
                         .with_py_type(py_type_ref));
                 }
                 "Union" => {
+                    // Get type arguments with proper py_type references
+                    let type_args = if let Ok(args) = py_type.getattr("__args__") {
+                        let args_seq = args.extract::<Vec<&PyAny>>()?;
+                        let mut type_infos = Vec::new();
+                        for arg in args_seq {
+                            // Extract each arg with its proper py_type reference
+                            let mut arg_info = PyTypeInfo::extract_from_python(arg)?;
+                            // Ensure the py_type is set
+                            if arg_info.py_type.is_none() {
+                                arg_info.py_type = Some(arg.into_py(py_type.py()));
+                            }
+                            type_infos.push(arg_info);
+                        }
+                        type_infos
+                    } else {
+                        Vec::new()
+                    };
+
                     // Check if this is Optional (Union[T, None])
                     let is_optional = type_args.iter().any(|arg| arg.kind == PyTypeKind::None);
 
@@ -350,7 +423,7 @@ impl PyTypeInfo {
                         .with_module(module_name.unwrap_or_else(|| "builtins".to_string()))
                         .with_fields(fields)
                         .with_py_type(py_type_ref));
-                } else if let Ok(bases) = py_type.getattr("__bases__") {
+                } else if let Ok(_bases) = py_type.getattr("__bases__") {
                     // This is likely a class type too
                     return Ok(PyTypeInfo::new(PyTypeKind::Class, type_name)
                         .with_module(module_name.unwrap_or_else(|| "builtins".to_string()))
@@ -464,7 +537,44 @@ pub fn json_to_python(
         JsonValue::Array(arr) => {
             let list = PyList::empty(py);
 
-            // Get element type if available
+            // Check if we're dealing with a tuple type
+            if let Some(PyTypeInfo {
+                kind: PyTypeKind::Tuple,
+                args,
+                py_type,
+                ..
+            }) = type_info
+            {
+                // Process tuple elements
+                for (i, item) in arr.iter().enumerate() {
+                    // For fixed tuples, use the appropriate type for each position
+                    let elem_type = if args.len() > 1 && i < args.len() {
+                        Some(&args[i])
+                    } else if args.len() == 1 {
+                        // Homogeneous tuple (Tuple[int, ...])
+                        Some(&args[0])
+                    } else {
+                        None
+                    };
+
+                    list.append(json_to_python(py, item, elem_type)?)?;
+                }
+
+                // Convert list to tuple
+                if let Some(py_type_ref) = py_type {
+                    let py_type_obj = py_type_ref.as_ref(py);
+                    // Try to construct using the Python type (this will create a tuple)
+                    if let Ok(result) = py_type_obj.call1((list,)) {
+                        return Ok(result.into());
+                    }
+                }
+
+                // Fallback: use Python's tuple() function
+                let tuple_type = py.eval("tuple", None, None)?;
+                return Ok(tuple_type.call1((list,))?.into());
+            }
+
+            // Get element type if available for lists
             let element_type = if let Some(PyTypeInfo {
                 kind: PyTypeKind::List,
                 args,
@@ -698,6 +808,11 @@ pub fn create_instance_from_json(
         }
     }
 
+    // For non-Deserializable classes, try to instantiate with kwargs
+    if let Ok(instance) = py_type.call((), Some(partial_data)) {
+        return Ok(instance.into());
+    }
+
     // Fallback to normal instantiation if __gasp_from_partial__ isn't available
     if let Ok(instance) = py_type.call0() {
         // Populate fields manually
@@ -735,61 +850,56 @@ pub fn create_instance_from_json(
     Ok(dict.into())
 }
 
-/// Convert a Python object to a JsonValue
-pub fn python_to_json(py: Python, obj: &PyAny) -> PyResult<JsonValue> {
-    if obj.is_none() {
-        return Ok(JsonValue::Null);
-    }
+/// Update an existing Python instance with new JSON data
+pub fn update_instance_from_json(
+    py: Python,
+    instance: &PyAny,
+    map: &HashMap<String, JsonValue>,
+    fields: &HashMap<String, PyTypeInfo>,
+) -> PyResult<PyObject> {
+    // If the instance has __gasp_update__ method, use it
+    if let Ok(update_method) = instance.getattr("__gasp_update__") {
+        let partial_data = PyDict::new(py);
 
-    if let Ok(s) = obj.extract::<String>() {
-        return Ok(JsonValue::String(s));
-    }
-
-    if let Ok(i) = obj.extract::<i64>() {
-        return Ok(JsonValue::Number(Number::Integer(i)));
-    }
-
-    if let Ok(f) = obj.extract::<f64>() {
-        return Ok(JsonValue::Number(Number::Float(f)));
-    }
-
-    if let Ok(b) = obj.extract::<bool>() {
-        return Ok(JsonValue::Boolean(b));
-    }
-
-    if let Ok(list) = obj.downcast::<PyList>() {
-        let mut arr = Vec::new();
-        for item in list.iter() {
-            arr.push(python_to_json(py, item)?);
+        // Convert the JSON map to a Python dict
+        for (k, v) in map {
+            let field_type = fields.get(k);
+            let py_value = json_to_python(py, v, field_type)?;
+            partial_data.set_item(k, py_value)?;
         }
-        return Ok(JsonValue::Array(arr));
+
+        update_method.call1((partial_data,))?;
+        return Ok(instance.into());
     }
 
-    if let Ok(dict) = obj.downcast::<PyDict>() {
-        let mut map = HashMap::new();
-        for (k, v) in dict.iter() {
-            let key = k.extract::<String>()?;
-            map.insert(key, python_to_json(py, v)?);
-        }
-        return Ok(JsonValue::Object(map));
-    }
+    // Otherwise, update attributes directly
+    for (k, v) in map {
+        let field_type = fields.get(k);
 
-    // If it's an object with __dict__
-    if let Ok(dict) = obj.getattr("__dict__") {
-        if let Ok(py_dict) = dict.downcast::<PyDict>() {
-            let mut map = HashMap::new();
-            for (k, v) in py_dict.iter() {
-                let key = k.extract::<String>()?;
-                if !key.starts_with('_') {
-                    // Skip private attributes
-                    map.insert(key, python_to_json(py, v)?);
-                }
+        // Process the value with the correct field type information
+        let py_value = match (v, field_type) {
+            // Process lists that contain complex objects
+            (JsonValue::Array(arr), Some(field_info))
+                if field_info.kind == PyTypeKind::List && !field_info.args.is_empty() =>
+            {
+                // Get the element type from the list's type args
+                let elem_type = &field_info.args[0];
+                process_list_with_element_type(py, arr, elem_type)?
             }
-            return Ok(JsonValue::Object(map));
-        }
+            // For nested objects, ensure we pass the type info
+            (JsonValue::Object(_), Some(field_info)) if field_info.kind == PyTypeKind::Class => {
+                json_to_python(py, v, Some(field_info))?
+            }
+            // For other lists
+            (JsonValue::Array(_), Some(field_info)) if field_info.kind == PyTypeKind::List => {
+                json_to_python(py, v, Some(field_info))?
+            }
+            // For other types, proceed normally
+            _ => json_to_python(py, v, field_type)?,
+        };
+
+        instance.setattr(k.as_str(), py_value)?;
     }
 
-    // Default: convert to string representation
-    let repr = obj.repr()?.extract::<String>()?;
-    Ok(JsonValue::String(repr))
+    Ok(instance.into())
 }

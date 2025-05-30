@@ -49,19 +49,22 @@ pip install gasp-py
 ## Quick Example
 
 ```python
-from gasp import Parser, Deserializable
+from gasp import Parser
 from typing import List, Optional
 
-class Address(Deserializable):
-    street: str
-    city: str
-    zip_code: str
+# Regular classes work now - no need for Deserializable
+class Address:
+    def __init__(self, street="", city="", zip_code=""):
+        self.street = street
+        self.city = city
+        self.zip_code = zip_code
 
-class Person(Deserializable):
-    name: str
-    age: int
-    address: Address
-    hobbies: Optional[List[str]] = None
+class Person:
+    def __init__(self, name="", age=0, address=None, hobbies=None):
+        self.name = name
+        self.age = age
+        self.address = address or Address()
+        self.hobbies = hobbies or []
 
 # Create a parser for the Person type
 parser = Parser(Person)
@@ -81,6 +84,52 @@ for chunk in chunks:
 person = parser.validate()
 print(f"Hello {person.name}!")  # Hello Alice!
 ```
+
+### Container Types
+
+Lists and tuples get their own tags:
+
+```python
+# List[T] uses <list> tag
+parser = Parser(List[int])
+result = parser.feed('<list>[1, 2, 3]</list>')  # returns [1, 2, 3]
+
+# Tuple[T, ...] uses <tuple> tag  
+parser = Parser(Tuple[str, int, bool])
+result = parser.feed('<tuple>["hello", 42, true]</tuple>')  # returns ("hello", 42, True)
+```
+
+## Using Deserializable for Advanced Streaming
+
+Regular classes work for most use cases. Use `Deserializable` when you need:
+
+- **Streaming control**: React to data as it arrives
+- **Custom validation**: Validate/transform data during parsing  
+- **State management**: Maintain computed fields or derived state
+
+```python
+from gasp import Deserializable
+
+class LiveDashboard(Deserializable):
+    def __init__(self):
+        self.events = []
+        self.summary_stats = {}
+    
+    def __gasp_update__(self, partial_data):
+        # React to streaming updates
+        if 'new_event' in partial_data:
+            self.events.append(partial_data['new_event'])
+            self._recalculate_stats()
+    
+    @classmethod
+    def __gasp_from_partial__(cls, partial_data):
+        # Custom instantiation logic
+        instance = cls()
+        # Apply defaults, validate, etc.
+        return instance
+```
+
+TL;DR: Regular classes for simple parsing, Deserializable for complex streaming behavior.
 
 ## Working with Pydantic
 
@@ -253,12 +302,14 @@ parsed_data = generator.parse_llm_output(llm_response)
 
 New approach:
 ```python
-from gasp import Deserializable, Parser
+from gasp import Parser
 from gasp.template_helpers import interpolate_prompt
 
-class Person(Deserializable):
-    name: str
-    age: int
+# Regular class
+class Person:
+    def __init__(self, name="", age=0):
+        self.name = name
+        self.age = age
 
 # Create a template with a {{return_type}} placeholder
 template = """

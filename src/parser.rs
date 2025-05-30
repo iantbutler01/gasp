@@ -11,6 +11,7 @@ pub struct TypedStreamParser {
     stream_parser: StreamParser,
     type_info: Option<PyTypeInfo>,
     partial_data: Option<JsonValue>,
+    partial_instance: Option<Py<PyAny>>, // Store the Python instance
     is_done: bool,
     pub expected_tags: Vec<String>,
 }
@@ -36,6 +37,7 @@ impl TypedStreamParser {
             stream_parser: StreamParser::new(Vec::new(), Vec::new()),
             type_info: None,
             partial_data: None,
+            partial_instance: None,
             is_done: false,
             expected_tags: Vec::new(),
         }
@@ -46,6 +48,7 @@ impl TypedStreamParser {
             stream_parser: StreamParser::new(Vec::new(), Vec::new()),
             type_info: Some(type_info),
             partial_data: None,
+            partial_instance: None,
             is_done: false,
             expected_tags: Vec::new(),
         }
@@ -89,7 +92,7 @@ impl TypedStreamParser {
     }
 
     /// Convert current partial data to Python object using type info
-    pub fn to_python_object(&self, py: Python) -> PyResult<Option<PyObject>> {
+    pub fn to_python_object(&mut self, py: Python) -> PyResult<Option<PyObject>> {
         match &self.partial_data {
             Some(data) => {
                 // Process any complex nested types by examining the structure of the data
@@ -98,18 +101,35 @@ impl TypedStreamParser {
                         if let Some(py_type_ref) = &type_info.py_type {
                             let py_type_obj = py_type_ref.as_ref(py);
 
-                            // Create a specialized instance that properly handles nested objects
-                            return Ok(Some(crate::python_types::create_instance_from_json(
-                                py,
-                                py_type_obj,
-                                map,
-                                &type_info.fields,
-                            )?));
+                            // Check if we have an existing instance to update
+                            if let Some(existing_instance) = &self.partial_instance {
+                                // Update the existing instance with new data
+                                let instance = crate::python_types::update_instance_from_json(
+                                    py,
+                                    existing_instance.as_ref(py),
+                                    map,
+                                    &type_info.fields,
+                                )?;
+                                return Ok(Some(instance));
+                            } else {
+                                // Create a new instance and store it
+                                let instance = crate::python_types::create_instance_from_json(
+                                    py,
+                                    py_type_obj,
+                                    map,
+                                    &type_info.fields,
+                                )?;
+
+                                // Store the instance for future updates
+                                self.partial_instance = Some(instance.clone_ref(py));
+
+                                return Ok(Some(instance));
+                            }
                         }
                     }
                 }
 
-                // Default conversion
+                // Default conversion (no instance tracking needed for non-class types)
                 Ok(Some(json_to_python(py, data, self.type_info.as_ref())?))
             }
             None => Ok(None),
@@ -184,11 +204,19 @@ impl PyParser {
                 }
 
                 // Get the type name to use as the expected tag
-                let tag_name = if let Ok(name) = obj.getattr("__name__") {
-                    name.extract::<String>()?
-                } else {
-                    // Use the name from type_info if available, otherwise empty string
-                    type_info.name.clone()
+                let tag_name = match &type_info.kind {
+                    crate::python_types::PyTypeKind::List => "list".to_string(),
+                    crate::python_types::PyTypeKind::Tuple => "tuple".to_string(),
+                    crate::python_types::PyTypeKind::Dict => "dict".to_string(),
+                    _ => {
+                        // For other types, try to get __name__ attribute
+                        if let Ok(name) = obj.getattr("__name__") {
+                            name.extract::<String>()?
+                        } else {
+                            // Use the name from type_info if available, otherwise empty string
+                            type_info.name.clone()
+                        }
+                    }
                 };
 
                 // Create a parser that only looks for this specific tag
@@ -280,13 +308,13 @@ impl PyParser {
 
     /// Get the current partial object without validation
     #[pyo3(text_signature = "($self)")]
-    fn get_partial(&self, py: Python) -> PyResult<Option<PyObject>> {
+    fn get_partial(&mut self, py: Python) -> PyResult<Option<PyObject>> {
         self.parser.to_python_object(py)
     }
 
     /// Perform full validation on the completed object
     #[pyo3(text_signature = "($self)")]
-    fn validate(&self, py: Python) -> PyResult<Option<PyObject>> {
+    fn validate(&mut self, py: Python) -> PyResult<Option<PyObject>> {
         // For now, just return the partial object
         // In future, we'll implement validation against the model
         self.get_partial(py)

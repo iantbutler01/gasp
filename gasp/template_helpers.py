@@ -20,7 +20,7 @@ def type_to_format_instructions(type_obj: Any, name: Optional[str] = None) -> st
     structure_examples = {}
     
     # Main formatting function
-    def format_type_with_examples(type_obj: Type, name: Optional[str] = None) -> str:
+    def format_type_with_examples(type_obj: Type, name: Optional[str] = None) -> Tuple[str, str]:
         # Check origin first to handle type aliases properly
         origin = get_origin(type_obj)
         
@@ -38,7 +38,7 @@ def type_to_format_instructions(type_obj: Any, name: Optional[str] = None) -> st
                 else:
                     tag_name = name or "Object"
                 # Format as union using __args__
-                return _format_union_type_from_args(actual_type.__args__, tag_name, structure_examples)
+                return tag_name, _format_union_type_from_args(actual_type.__args__, tag_name, structure_examples)
             
             origin = get_origin(actual_type)
             # Use the type alias name if no explicit name provided
@@ -58,41 +58,43 @@ def type_to_format_instructions(type_obj: Any, name: Optional[str] = None) -> st
         if origin is Union:
             # If we detected a union through type alias, use the actual type
             if hasattr(type_obj, '__value__'):
-                return _format_union_type(type_obj.__value__, tag_name, structure_examples)
+                return tag_name, _format_union_type(type_obj.__value__, tag_name, structure_examples)
             else:
-                return _format_union_type(type_obj, tag_name, structure_examples)
+                return tag_name, _format_union_type(type_obj, tag_name, structure_examples)
         
         # Handle List types
         if origin is list:
-            return _format_list_type(type_obj, tag_name, structure_examples)
+            return tag_name, _format_list_type(type_obj, tag_name, structure_examples)
         
         # Handle Dict types
         if origin is dict:
-            return _format_dict_type(type_obj, tag_name, structure_examples)
+            return tag_name, _format_dict_type(type_obj, tag_name, structure_examples)
         
         # Handle primitive types
         if type_obj is str:
-            return f"<{tag_name}>\"your string value\"</{tag_name}>"
+            return tag_name, f"<{tag_name}>\"your string value\"</{tag_name}>"
         if type_obj is int or type_obj is float:
-            return f"<{tag_name}>42</{tag_name}>"
+            return tag_name, f"<{tag_name}>42</{tag_name}>"
         if type_obj is bool:
-            return f"<{tag_name}>true</{tag_name}>"
+            return tag_name, f"<{tag_name}>true</{tag_name}>"
         
         # Handle classes (objects with fields)
-        return _format_class_type(type_obj, tag_name, structure_examples)
+        return tag_name, _format_class_type(type_obj, tag_name, structure_examples)
     
     # Generate the main format instruction
-    instructions = format_type_with_examples(type_obj, name)
+    tag_name, main_format = format_type_with_examples(type_obj, name)
     
-    # Add structure examples for complex types if any were collected
+    # Build the final instructions with structure examples first
     if structure_examples:
         examples_text = []
         for type_name, type_structure in structure_examples.items():
             examples_text.append(f"Each {type_name} object should have this structure:\n{type_structure}")
         
-        # Add the examples to the instructions
-        instructions += "\n\n" + "\n\n".join(examples_text)
-        instructions += "\n\nUse valid JSON format inside the tags."
+        instructions = "\\n\\n".join(examples_text)
+        instructions += "\\nYour response should be formatted as:\\n\\n" + main_format
+        instructions += f"\\nIMPORTANT: You MUST wrap your json response in the EXACT tags <{tag_name}> and </{tag_name}>. Do NOT use ```json code blocks. The tags are required for proper parsing."
+    else:
+        instructions = main_format
     
     return instructions
 
@@ -157,8 +159,6 @@ def _format_class_type(cls: Type, tag_name: str, structure_examples: Dict[str, s
             field_class_name = getattr(field_type, "__name__", "Object")
             if field_class_name not in structure_examples:
                 structure_examples[field_class_name] = _generate_structure_example(field_type)
-    
-    fields_str = ",\n".join(fields)
     
     # Add this class type to structure examples with _type_name
     fields_with_type_name = [f'  "_type_name": "{class_name}"'] + fields

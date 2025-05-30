@@ -4,10 +4,6 @@
 use crate::json_tok::{Kind, Tokenizer};
 use crate::json_types::JsonError;
 
-fn is_value_delim(b: u8) -> bool {
-    matches!(b, b',' | b'}' | b']')
-}
-
 /// Loss‑less structural / scalar events.
 #[derive(Debug)]
 pub enum Event<'a> {
