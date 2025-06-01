@@ -1,6 +1,7 @@
 //! Incremental tag-scanner:  <Tag> … (raw bytes) … </Tag>
 
 use crate::json_types::JsonError;
+use log::debug;
 
 #[derive(Debug)]
 pub enum TagEvent {
@@ -42,11 +43,24 @@ impl TagFinder {
     /// * `wanted` - Tags to specifically process. If empty, all non-ignored tags are processed.
     /// * `ignored` - Tags to completely ignore. These tags and their content will be skipped.
     pub fn new_with_filter(wanted: Vec<String>, ignored: Vec<String>) -> Self {
+        debug!(
+            "[TagFinder::new_with_filter] Received wanted: {:?}, ignored: {:?}",
+            wanted, ignored
+        );
+        // Store lowercase versions for case-insensitive matching
+        let wanted_set: std::collections::HashSet<String> =
+            wanted.into_iter().map(|s| s.to_lowercase()).collect();
+        let ignored_set: std::collections::HashSet<String> =
+            ignored.into_iter().map(|s| s.to_lowercase()).collect();
+        debug!(
+            "[TagFinder::new_with_filter] Initialized self.wanted (lowercase): {:?}, self.ignored (lowercase): {:?}",
+            wanted_set, ignored_set
+        );
         Self {
             buf: String::new(),
             inside: false,
-            wanted: wanted.into_iter().collect(),
-            ignored: ignored.into_iter().collect(),
+            wanted: wanted_set,
+            ignored: ignored_set,
             inside_ignored: false,
             ignored_depth: 0,
         }
@@ -61,9 +75,13 @@ impl TagFinder {
         chunk: &str,
         mut emit: impl FnMut(TagEvent) -> Result<(), JsonError>,
     ) -> Result<(), JsonError> {
+        debug!("[TagFinder::push] Received chunk: '{}'", chunk);
         self.buf.push_str(chunk);
+        debug!("[TagFinder::push] Current buffer: '{}'", self.buf);
+        debug!("[TagFinder::push] Current state: inside={}, inside_ignored={}, ignored_depth={}, wanted={:?}, ignored={:?}", self.inside, self.inside_ignored, self.ignored_depth, self.wanted, self.ignored);
 
         loop {
+            debug!("[TagFinder::push] Loop start. Buffer: '{}'", self.buf);
             /*──────── look for the next '<' ───────────────────────────*/
             let lt = match self.buf.find('<') {
                 Some(i) => i,
@@ -71,11 +89,23 @@ impl TagFinder {
             };
 
             /*──────── everything *before* it is payload ──────────────*/
-            if self.inside && !self.inside_ignored && lt > 0 {
-                let payload = self.buf[..lt].to_owned();
-                if !payload.is_empty() {
-                    emit(TagEvent::Bytes(payload))?;
+            if lt > 0 {
+                let leading_text = self.buf[..lt].to_owned();
+                debug!(
+                    "[TagFinder::push] Found '<' at index {}. Leading text: '{}'",
+                    lt, leading_text
+                );
+                if self.inside && !self.inside_ignored && !leading_text.is_empty() {
+                    debug!(
+                        "[TagFinder::push] Emitting Bytes for leading_text: '{}'",
+                        leading_text
+                    );
+                    emit(TagEvent::Bytes(leading_text))?;
+                } else {
+                    debug!("[TagFinder::push] Not emitting leading_text (inside: {}, inside_ignored: {}, empty: {})", self.inside, self.inside_ignored, leading_text.is_empty());
                 }
+            } else {
+                debug!("[TagFinder::push] Found '<' at index 0. No leading text.");
             }
 
             /*──────── look for the matching '>' ───────────────────────*/
@@ -83,75 +113,138 @@ impl TagFinder {
                 Some(off) => lt + off,
                 None => {
                     // tag split across chunks → keep tail for next push()
-                    self.buf.drain(..lt); // drop handled bytes
+                    debug!("[TagFinder::push] Tag split across chunks. Draining buf up to lt: {}. Remaining buf: '{}'", lt, &self.buf[lt..]);
+                    self.buf.drain(..lt); // drop handled bytes before the incomplete tag
                     return Ok(());
                 }
             };
+            debug!(
+                "[TagFinder::push] Found matching '>' at index {}. Tag content: '{}'",
+                gt,
+                &self.buf[lt..=gt]
+            );
 
             /*──────── analyse the tag ────────────────────────────────*/
             let tag_body = &self.buf[lt + 1..gt]; // without '<' / '>'
             let is_close = tag_body.starts_with('/');
             let name_part = if is_close { &tag_body[1..] } else { tag_body };
-            // strip attributes if present, keep only the tag name
-            let name = name_part.split_whitespace().next().unwrap_or("").to_owned();
+            let name = name_part.split_whitespace().next().unwrap_or("").to_owned(); // Original case name from text
+            let name_lower = name.to_lowercase(); // Lowercase for matching
+            debug!(
+                "[TagFinder::push] Tag analysis: body='{}', is_close={}, name='{}', name_lower='{}'",
+                tag_body, is_close, name, name_lower
+            );
 
-            // Check if this tag is ignored
-            let is_ignored = self.ignored.contains(&name);
+            // Check if this tag is ignored (use lowercase for comparison)
+            let is_ignored = self.ignored.contains(&name_lower);
+            debug!(
+                "[TagFinder::push] Tag '{}' (lower: '{}') is_ignored: {} (self.ignored (lowercase): {:?})",
+                name, name_lower, is_ignored, self.ignored
+            );
 
-            // Check if this tag is wanted (or if wanted list is empty, all non-ignored tags are wanted)
+            // Check if this tag is wanted (use lowercase for comparison)
             let is_wanted = if self.wanted.is_empty() {
-                !is_ignored
+                !is_ignored // If not specifically ignored, and wanted list is empty, it's wanted.
             } else {
-                self.wanted.contains(&name)
+                self.wanted.contains(&name_lower)
             };
+            debug!(
+                "[TagFinder::push] Tag '{}' (lower: '{}') is_wanted: {} (self.wanted (lowercase): {:?})",
+                name, name_lower, is_wanted, self.wanted
+            );
 
             // If we're inside a wanted tag and not in an ignored section,
-            // emit the entire tag as content (for nested tags)
+            // emit the entire tag as content (for nested tags that are not themselves wanted/ignored)
             if self.inside && !self.inside_ignored && !is_wanted && !is_ignored {
-                // This is a nested tag inside a wanted tag - emit it as content
+                // is_wanted and is_ignored are now based on name_lower
                 let tag_content = self.buf[lt..=gt].to_owned();
+                debug!(
+                    "[TagFinder::push] Nested tag detected: '{}'. Emitting as Bytes.",
+                    tag_content
+                );
                 emit(TagEvent::Bytes(tag_content))?;
                 self.buf.drain(..gt + 1);
+                debug!(
+                    "[TagFinder::push] Drained nested tag. Remaining buf: '{}'",
+                    self.buf
+                );
                 continue;
             }
 
             if !is_close {
                 /* <Tag> : opening tag */
+                debug!("[TagFinder::push] Processing Open Tag: '{}'", name);
                 if is_ignored {
-                    // Start ignoring content
                     self.inside_ignored = true;
                     self.ignored_depth += 1;
+                    debug!("[TagFinder::push] Opened ignored tag '{}'. inside_ignored={}, ignored_depth={}", name, self.inside_ignored, self.ignored_depth);
                 } else if is_wanted && !self.inside_ignored {
-                    // Process wanted tags
+                    debug!("[TagFinder::push] Emitting Open for wanted tag: '{}'", name);
                     emit(TagEvent::Open(name.clone()))?;
-                    // Only set inside=true if we're not already inside another wanted tag
                     if !self.inside {
                         self.inside = true;
+                        debug!(
+                            "[TagFinder::push] Set self.inside = true for tag '{}'",
+                            name
+                        );
+                    } else {
+                        debug!(
+                            "[TagFinder::push] Already self.inside=true for tag '{}'",
+                            name
+                        );
                     }
+                } else {
+                    debug!("[TagFinder::push] Open Tag '{}' is not wanted or currently inside ignored. is_wanted={}, inside_ignored={}", name, is_wanted, self.inside_ignored);
                 }
             } else {
                 /* </Tag> : closing tag */
+                debug!("[TagFinder::push] Processing Close Tag: '{}'", name);
                 if is_ignored && self.inside_ignored {
                     self.ignored_depth -= 1;
                     if self.ignored_depth == 0 {
                         self.inside_ignored = false;
                     }
+                    debug!("[TagFinder::push] Closed ignored tag '{}'. inside_ignored={}, ignored_depth={}", name, self.inside_ignored, self.ignored_depth);
                 } else if is_wanted && !self.inside_ignored {
+                    debug!(
+                        "[TagFinder::push] Emitting Close for wanted tag: '{}'",
+                        name
+                    );
                     emit(TagEvent::Close(name.clone()))?;
-                    // Check if we're closing the outermost wanted tag
-                    // For simplicity, we'll just check if this is the last wanted tag
-                    self.inside = false;
+                    self.inside = false; // Assuming this closes the primary wanted tag
+                    debug!(
+                        "[TagFinder::push] Set self.inside = false for tag '{}'",
+                        name
+                    );
+                } else {
+                    debug!("[TagFinder::push] Close Tag '{}' is not wanted or currently inside ignored. is_wanted={}, inside_ignored={}", name, is_wanted, self.inside_ignored);
                 }
             }
 
             /*──────── consume the tag itself ─────────────────────────*/
             self.buf.drain(..gt + 1);
+            debug!(
+                "[TagFinder::push] Drained processed tag. Remaining buf: '{}'",
+                self.buf
+            );
         }
+        debug!("[TagFinder::push] Loop end. Final buffer: '{}'", self.buf);
 
         /*──────── no '<' left in buffer – handle tail ───────────────*/
         if self.inside && !self.inside_ignored && !self.buf.is_empty() {
-            emit(TagEvent::Bytes(std::mem::take(&mut self.buf)))?;
+            let tail_payload = std::mem::take(&mut self.buf);
+            debug!(
+                "[TagFinder::push] Emitting Bytes for tail payload: '{}'",
+                tail_payload
+            );
+            emit(TagEvent::Bytes(tail_payload))?;
         } else {
+            debug!(
+                "[TagFinder::push] Tail handling: inside={}, inside_ignored={}, buf_empty={}",
+                self.inside,
+                self.inside_ignored,
+                self.buf.is_empty()
+            );
             // keep only a tiny tail (≤200 chars) to recognise a split tag
             let keep = self.buf.len().min(200);
             let tail = self.buf.split_off(self.buf.len() - keep);

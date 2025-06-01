@@ -83,35 +83,52 @@ class Deserializable:
             fields[name] = {"type": type_hint}
         return fields
     
-    def model_dump(self):
+    def model_dump(self, exclude_none=True):
         """Convert model to dict (Pydantic V2 compatible)"""
         result = {}
         for k, v in self.__dict__.items():
             if k.startswith('_'):
                 continue
-                
+
+            # Exclude fields with value None if exclude_none is True
+            if exclude_none and v is None:
+                continue
+
             # Recursively dump nested Deserializable objects
             if isinstance(v, Deserializable):
-                result[k] = v.model_dump()
+                dumped = v.model_dump(exclude_none=exclude_none)
+                if not (exclude_none and dumped is None):
+                    result[k] = dumped
             # Handle lists that might contain Deserializable objects
             elif isinstance(v, list):
                 dumped_list = []
                 for item in v:
                     if isinstance(item, Deserializable):
-                        dumped_list.append(item.model_dump())
+                        dumped_item = item.model_dump(exclude_none=exclude_none)
+                        if not (exclude_none and dumped_item is None):
+                            dumped_list.append(dumped_item)
                     else:
-                        dumped_list.append(item)
+                        if not (exclude_none and item is None):
+                            dumped_list.append(item)
                 result[k] = dumped_list
             # Handle dictionaries that might contain Deserializable objects
             elif isinstance(v, dict):
                 dumped_dict = {}
                 for dict_k, dict_v in v.items():
                     if isinstance(dict_v, Deserializable):
-                        dumped_dict[dict_k] = dict_v.model_dump()
+                        dumped_item = dict_v.model_dump(exclude_none=exclude_none)
+                        if not (exclude_none and dumped_item is None):
+                            dumped_dict[dict_k] = dumped_item
                     else:
-                        dumped_dict[dict_k] = dict_v
+                        if not (exclude_none and dict_v is None):
+                            dumped_dict[dict_k] = dict_v
                 result[k] = dumped_dict
             else:
                 result[k] = v
-                
+
         return result
+    
+    def model_dump_json(self):
+        """Convert model to JSON string (Pydantic V2 compatible)"""
+        import json
+        return json.dumps(self.model_dump(), ensure_ascii=False, indent=2)

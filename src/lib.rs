@@ -88,9 +88,10 @@ impl PyStreamParser {
     /// Feed a chunk; returns the parsed value once complete, else `None`.
     #[pyo3(text_signature = "($self, chunk)")]
     fn parse<'p>(&mut self, py: Python<'p>, chunk: &str) -> PyResult<Option<PyObject>> {
+        // Pass None for root_target_type as PyStreamParser is not type-aware in its Python API
         let step_out = self
             .parser
-            .step(chunk)
+            .step(chunk, None) // This call should already be correct from previous attempt.
             .map_err(|e| PyValueError::new_err(format!("stream error: {:?}", e)))?;
 
         if let Some(val) = step_out {
@@ -110,6 +111,9 @@ impl PyStreamParser {
 /// Python module for parsing structured outputs into typed objects
 #[pymodule]
 fn gasp(py: Python, m: &PyModule) -> PyResult<()> {
+    // Initialize the logger. try_init() is used to avoid panic if already initialized.
+    let _ = env_logger::try_init();
+
     // Add base parser
     m.add_class::<PyStreamParser>()?;
 

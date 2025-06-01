@@ -3,6 +3,7 @@ Helpers for generating type-specific format instructions for LLM prompts.
 """
 import inspect
 import typing
+import types
 from typing import Any, Dict, List, Optional, Tuple, Type, Union, get_type_hints, get_origin, get_args
 
 def type_to_format_instructions(type_obj: Any, name: Optional[str] = None) -> str:
@@ -55,7 +56,7 @@ def type_to_format_instructions(type_obj: Any, name: Optional[str] = None) -> st
                 tag_name = getattr(type_obj, "__name__", "Object")
         
         # Handle Union types
-        if origin is Union:
+        if origin is Union or origin is typing.Union:
             # If we detected a union through type alias, use the actual type
             if hasattr(type_obj, '__value__'):
                 return tag_name, _format_union_type(type_obj.__value__, tag_name, structure_examples)
@@ -63,11 +64,11 @@ def type_to_format_instructions(type_obj: Any, name: Optional[str] = None) -> st
                 return tag_name, _format_union_type(type_obj, tag_name, structure_examples)
         
         # Handle List types
-        if origin is list:
+        if origin is list or origin is typing.List:
             return tag_name, _format_list_type(type_obj, tag_name, structure_examples)
         
         # Handle Dict types
-        if origin is dict:
+        if origin is dict or origin is typing.Dict:
             return tag_name, _format_dict_type(type_obj, tag_name, structure_examples)
         
         # Handle primitive types
@@ -83,18 +84,22 @@ def type_to_format_instructions(type_obj: Any, name: Optional[str] = None) -> st
     
     # Generate the main format instruction
     tag_name, main_format = format_type_with_examples(type_obj, name)
-    
+
+    print("Structure examples collected:", structure_examples)
+
     # Build the final instructions with structure examples first
     if structure_examples:
         examples_text = []
         for type_name, type_structure in structure_examples.items():
             examples_text.append(f"Each {type_name} object should have this structure:\n{type_structure}")
-        
-        instructions = "\\n\\n".join(examples_text)
-        instructions += "\\nYour response should be formatted as:\\n\\n" + main_format
-        instructions += f"\\nIMPORTANT: You MUST wrap your json response in the EXACT tags <{tag_name}> and </{tag_name}>. Do NOT use ```json code blocks. The tags are required for proper parsing."
+
+        instructions = f"Here are some examples of the expected structure for different types when they are mentioned in the return type:\n\n"
+        instructions += "\n\n".join(examples_text)
+        instructions += "\nYour response should be formatted as:\n\n" + main_format
+        instructions += f"\nIMPORTANT: You MUST wrap your json response in the EXACT tags <{tag_name}> and </{tag_name}>. Do NOT use ```json code blocks. The tags are required for proper parsing."
     else:
-        instructions = main_format
+        instructions = "\nYour response should be formatted as:\n\n" + main_format
+        instructions += f"\nIMPORTANT: You MUST wrap your json response in the EXACT tags <{tag_name}> and </{tag_name}>. Do NOT use ```json code blocks. The tags are required for proper parsing."
     
     return instructions
 
@@ -144,7 +149,7 @@ def _format_class_type(cls: Type, tag_name: str, structure_examples: Dict[str, s
                 item_class_name = getattr(item_type, "__name__", "Object")
                 # Add the item type to structure examples if not already there
                 if item_class_name not in structure_examples:
-                    structure_examples[item_class_name] = _generate_structure_example(item_type)
+                    structure_examples[item_class_name] = _generate_structure_example_with_type_name(item_type, item_class_name)
         elif origin is dict:
             # If it's a dict with complex values, add them to examples
             args = get_args(field_type)
@@ -153,12 +158,12 @@ def _format_class_type(cls: Type, tag_name: str, structure_examples: Dict[str, s
                 value_class_name = getattr(value_type, "__name__", "Object")
                 # Add the value type to structure examples if not already there
                 if value_class_name not in structure_examples:
-                    structure_examples[value_class_name] = _generate_structure_example(value_type)
+                    structure_examples[value_class_name] = _generate_structure_example_with_type_name(value_type, value_class_name)
         elif _is_complex_type(field_type) and not (origin is Union):
             # If it's a direct complex type, add it to examples
             field_class_name = getattr(field_type, "__name__", "Object")
             if field_class_name not in structure_examples:
-                structure_examples[field_class_name] = _generate_structure_example(field_type)
+                structure_examples[field_class_name] = _generate_structure_example_with_type_name(field_type, field_class_name)
     
     # Add this class type to structure examples with _type_name
     fields_with_type_name = [f'  "_type_name": "{class_name}"'] + fields
@@ -176,15 +181,23 @@ def _is_complex_type(type_obj: Type) -> bool:
     
     # Check if it's a class type
     origin = get_origin(type_obj)
-    if origin is Union:
+
+    print(type_obj)
+
+    if origin is None:
+        if hasattr(type_obj, '__value__'):
+            type_obj = type_obj.__value__
+            origin = get_origin(type_obj)
+
+    if origin is Union or origin is typing.Union:
         # For unions, check if any member is complex
         args = get_args(type_obj)
         return any(_is_complex_type(arg) for arg in args)
-    elif origin is list:
+    elif origin is list or origin is typing.List:
         # For lists, check if the item type is complex
         args = get_args(type_obj)
         return bool(args) and _is_complex_type(args[0])
-    elif origin is dict:
+    elif origin is dict or origin is typing.Dict:
         # For dicts, check if the value type is complex
         args = get_args(type_obj)
         return len(args) == 2 and _is_complex_type(args[1])
@@ -198,69 +211,15 @@ def _is_complex_type(type_obj: Type) -> bool:
         # If we can't get type hints, it's probably not a complex type
         return False
 
-def _generate_structure_example(type_obj: Type) -> str:
-    """Generate a structure example for a complex type."""
-    # Handle different kinds of complex types
-    origin = get_origin(type_obj)
-    
-    if origin is Union:
-        # For unions, generate examples for each option
-        args = get_args(type_obj)
-        options = []
-        for i, arg in enumerate(args):
-            if arg is not type(None):  # Skip None type
-                options.append(f"// Option {i+1}:\n{_generate_structure_example(arg)}")
-        
-        return "\n\n- OR -\n\n".join(options)
-    
-    elif origin is list:
-        # For lists, provide example content
-        args = get_args(type_obj)
-        if args and _is_complex_type(args[0]):
-            item_example = _generate_structure_example(args[0])
-            return f"[\n  {item_example},\n  ...\n]"
-        else:
-            return "[...]"
-    
-    elif origin is dict:
-        # For dicts, provide example keys and values
-        args = get_args(type_obj)
-        if len(args) == 2:
-            key_type, value_type = args
-            key_example = _get_type_description(key_type, simple=True)
-            if _is_complex_type(value_type):
-                value_example = _generate_structure_example(value_type)
-                return f'{{\n  "{key_example}": {value_example},\n  ...\n}}'
-            else:
-                value_example = _get_type_description(value_type, simple=True)
-                return f'{{\n  "{key_example}": {value_example},\n  ...\n}}'
-        else:
-            return "{...}"
-    
-    # For classes, get their field types
-    try:
-        hints = get_type_hints(type_obj)
-        if not hints:
-            return "{}"
-            
-        fields = []
-        for field_name, field_type in hints.items():
-            if field_name.startswith('_'):
-                continue
-                
-            field_type_str = _get_type_description(field_type)
-            fields.append(f'  "{field_name}": {field_type_str}')
-            
-        fields_str = ",\n".join(fields)
-        return f"{{\n{fields_str}\n}}"
-    except (TypeError, AttributeError):
-        # If we can't get type hints, just return a generic object
-        return "{...}"
-
 def _generate_structure_example_with_type_name(type_obj: Type, type_name: str) -> str:
     """Generate a structure example for a complex type with _type_name discrimination field."""
     # Handle different kinds of complex types
     origin = get_origin(type_obj)
+
+    if origin is None:
+        if hasattr(type_obj, '__value__'):
+            type_obj = type_obj.__value__
+            origin = get_origin(type_obj)
     
     if origin is Union:
         # For unions, generate examples for each option
@@ -368,7 +327,7 @@ def _format_optional_type(type_obj: Type, tag_name: str, structure_examples: Dic
         
         # Add the type to structure examples
         if type_name not in structure_examples:
-            structure_examples[type_name] = _generate_structure_example(type_obj)
+            structure_examples[type_name] = _generate_structure_example_with_type_name(type_obj, type_name)
     else:
         # For simple types, use standard format
         simple_format = type_to_format_instructions(type_obj, tag_name)
@@ -399,7 +358,7 @@ def _format_list_type(list_type: Type, tag_name: str, structure_examples: Dict[s
         
         # Add the item type to structure examples
         if item_name not in structure_examples:
-            structure_examples[item_name] = _generate_structure_example(item_type)
+            structure_examples[item_name] = _generate_structure_example_with_type_name(item_type, item_name)
         
         return f"<{tag_name}>[...array of {item_name} objects...]</{tag_name}>"
     else:
@@ -422,7 +381,7 @@ def _format_dict_type(dict_type: Type, tag_name: str, structure_examples: Dict[s
         
         # Add the value type to structure examples
         if value_name not in structure_examples:
-            structure_examples[value_name] = _generate_structure_example(value_type)
+            structure_examples[value_name] = _generate_structure_example_with_type_name(value_type, value_name)
         
         return f"<{tag_name}>{{...dictionary mapping {key_desc} to {value_name} objects...}}</{tag_name}>"
     else:
@@ -541,6 +500,5 @@ def interpolate_prompt(template: str, type_obj: Any, format_tag: str = "return_t
         return template
     
     instructions = type_to_format_instructions(type_obj, name=name)
-    instructions_with_header = f"Your response should be formatted as:\n\n{instructions}"
     
-    return template.replace(placeholder, instructions_with_header)
+    return template.replace(placeholder, instructions)

@@ -1,6 +1,7 @@
+use log::debug;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use std::collections::HashMap;
+use std::collections::HashMap; // Added this line
 
 use crate::json_types::{JsonValue, Number};
 
@@ -446,7 +447,237 @@ pub fn json_to_python(
     type_info: Option<&PyTypeInfo>,
 ) -> PyResult<PyObject> {
     match value {
+        JsonValue::String(s) => {
+            if let Some(ti) = type_info {
+                match ti.kind {
+                    PyTypeKind::List if !ti.args.is_empty() => {
+                        let element_type_info = &ti.args[0];
+                        if matches!(
+                            element_type_info.kind,
+                            PyTypeKind::Class | PyTypeKind::Union
+                        ) {
+                            debug!("[json_to_python] Coercing String to List[Class/Union]. String: {:.50?}, Expected element: {:?}", s, element_type_info.name);
+                            let mut obj_map = HashMap::new();
+                            // Heuristic: use first field name or "content"
+                            let field_name = element_type_info
+                                .fields
+                                .keys()
+                                .next()
+                                .cloned()
+                                .unwrap_or_else(|| "content".to_string());
+                            obj_map.insert(field_name, JsonValue::String(s.clone()));
+
+                            let item_type_name_to_use = if element_type_info.kind
+                                == PyTypeKind::Union
+                            {
+                                element_type_info
+                                    .args
+                                    .iter()
+                                    .find(|arg| arg.kind == PyTypeKind::Class)
+                                    .map_or(element_type_info.name.clone(), |arg| arg.name.clone())
+                            } else {
+                                // Class
+                                element_type_info.name.clone()
+                            };
+                            obj_map.insert(
+                                "_type_name".to_string(),
+                                JsonValue::String(item_type_name_to_use),
+                            );
+
+                            let wrapped_value = JsonValue::Array(vec![JsonValue::Object(obj_map)]);
+                            return json_to_python(py, &wrapped_value, Some(ti));
+                            // Recurse with original List type_info
+                        }
+                    }
+                    PyTypeKind::Class | PyTypeKind::Union => {
+                        debug!("[json_to_python] Coercing String to Class/Union. String: {:.50?}, Expected: {:?}", s, ti.name);
+                        let mut obj_map = HashMap::new();
+                        let field_name = ti
+                            .fields
+                            .keys()
+                            .next()
+                            .cloned()
+                            .unwrap_or_else(|| "content".to_string());
+                        obj_map.insert(field_name, JsonValue::String(s.clone()));
+
+                        let type_name_to_use = if ti.kind == PyTypeKind::Union {
+                            ti.args
+                                .iter()
+                                .find(|arg| arg.kind == PyTypeKind::Class)
+                                .map_or(ti.name.clone(), |arg| arg.name.clone())
+                        } else {
+                            // Class
+                            ti.name.clone()
+                        };
+                        obj_map.insert(
+                            "_type_name".to_string(),
+                            JsonValue::String(type_name_to_use),
+                        );
+
+                        let wrapped_value = JsonValue::Object(obj_map);
+                        return json_to_python(py, &wrapped_value, Some(ti)); // Recurse with original Class/Union type_info
+                    }
+                    _ => {} // Fall through to default string conversion
+                }
+            }
+            Ok(s.clone().into_py(py))
+        }
+        JsonValue::Number(n) => {
+            // Apply similar coercion for Numbers
+            if let Some(ti) = type_info {
+                match ti.kind {
+                    PyTypeKind::List if !ti.args.is_empty() => {
+                        let element_type_info = &ti.args[0];
+                        if matches!(
+                            element_type_info.kind,
+                            PyTypeKind::Class | PyTypeKind::Union
+                        ) {
+                            debug!("[json_to_python] Coercing Number to List[Class/Union]. Number: {:?}, Expected element: {:?}", n, element_type_info.name);
+                            let mut obj_map = HashMap::new();
+                            let field_name = element_type_info
+                                .fields
+                                .keys()
+                                .next()
+                                .cloned()
+                                .unwrap_or_else(|| "value".to_string());
+                            obj_map.insert(field_name, JsonValue::Number(n.clone()));
+                            let item_type_name_to_use = if element_type_info.kind
+                                == PyTypeKind::Union
+                            {
+                                element_type_info
+                                    .args
+                                    .iter()
+                                    .find(|arg| arg.kind == PyTypeKind::Class)
+                                    .map_or(element_type_info.name.clone(), |arg| arg.name.clone())
+                            } else {
+                                element_type_info.name.clone()
+                            };
+                            obj_map.insert(
+                                "_type_name".to_string(),
+                                JsonValue::String(item_type_name_to_use),
+                            );
+                            let wrapped_value = JsonValue::Array(vec![JsonValue::Object(obj_map)]);
+                            return json_to_python(py, &wrapped_value, Some(ti));
+                        }
+                    }
+                    PyTypeKind::Class | PyTypeKind::Union => {
+                        debug!("[json_to_python] Coercing Number to Class/Union. Number: {:?}, Expected: {:?}", n, ti.name);
+                        let mut obj_map = HashMap::new();
+                        let field_name = ti
+                            .fields
+                            .keys()
+                            .next()
+                            .cloned()
+                            .unwrap_or_else(|| "value".to_string());
+                        obj_map.insert(field_name, JsonValue::Number(n.clone()));
+                        let type_name_to_use = if ti.kind == PyTypeKind::Union {
+                            ti.args
+                                .iter()
+                                .find(|arg| arg.kind == PyTypeKind::Class)
+                                .map_or(ti.name.clone(), |arg| arg.name.clone())
+                        } else {
+                            ti.name.clone()
+                        };
+                        obj_map.insert(
+                            "_type_name".to_string(),
+                            JsonValue::String(type_name_to_use),
+                        );
+                        let wrapped_value = JsonValue::Object(obj_map);
+                        return json_to_python(py, &wrapped_value, Some(ti));
+                    }
+                    _ => {}
+                }
+            }
+            // Default number conversion (original logic was more detailed here)
+            match n {
+                Number::Integer(i) => Ok(i.into_py(py)),
+                Number::Float(f) => Ok(f.into_py(py)),
+            }
+        }
+        JsonValue::Boolean(b) => {
+            // Apply similar coercion for Booleans
+            if let Some(ti) = type_info {
+                match ti.kind {
+                    PyTypeKind::List if !ti.args.is_empty() => {
+                        let element_type_info = &ti.args[0];
+                        if matches!(
+                            element_type_info.kind,
+                            PyTypeKind::Class | PyTypeKind::Union
+                        ) {
+                            debug!("[json_to_python] Coercing Boolean to List[Class/Union]. Boolean: {:?}, Expected element: {:?}", b, element_type_info.name);
+                            let mut obj_map = HashMap::new();
+                            let field_name = element_type_info
+                                .fields
+                                .keys()
+                                .next()
+                                .cloned()
+                                .unwrap_or_else(|| "flag".to_string());
+                            obj_map.insert(field_name, JsonValue::Boolean(*b));
+                            let item_type_name_to_use = if element_type_info.kind
+                                == PyTypeKind::Union
+                            {
+                                element_type_info
+                                    .args
+                                    .iter()
+                                    .find(|arg| arg.kind == PyTypeKind::Class)
+                                    .map_or(element_type_info.name.clone(), |arg| arg.name.clone())
+                            } else {
+                                element_type_info.name.clone()
+                            };
+                            obj_map.insert(
+                                "_type_name".to_string(),
+                                JsonValue::String(item_type_name_to_use),
+                            );
+                            let wrapped_value = JsonValue::Array(vec![JsonValue::Object(obj_map)]);
+                            return json_to_python(py, &wrapped_value, Some(ti));
+                        }
+                    }
+                    PyTypeKind::Class | PyTypeKind::Union => {
+                        debug!("[json_to_python] Coercing Boolean to Class/Union. Boolean: {:?}, Expected: {:?}", b, ti.name);
+                        let mut obj_map = HashMap::new();
+                        let field_name = ti
+                            .fields
+                            .keys()
+                            .next()
+                            .cloned()
+                            .unwrap_or_else(|| "flag".to_string());
+                        obj_map.insert(field_name, JsonValue::Boolean(*b));
+                        let type_name_to_use = if ti.kind == PyTypeKind::Union {
+                            ti.args
+                                .iter()
+                                .find(|arg| arg.kind == PyTypeKind::Class)
+                                .map_or(ti.name.clone(), |arg| arg.name.clone())
+                        } else {
+                            ti.name.clone()
+                        };
+                        obj_map.insert(
+                            "_type_name".to_string(),
+                            JsonValue::String(type_name_to_use),
+                        );
+                        let wrapped_value = JsonValue::Object(obj_map);
+                        return json_to_python(py, &wrapped_value, Some(ti));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(b.into_py(py))
+        }
         JsonValue::Object(map) => {
+            // Coercion: If type_info is List[Class/Union] but value is a single Object, wrap it in an array.
+            if let Some(ti) = type_info {
+                if ti.kind == PyTypeKind::List && !ti.args.is_empty() {
+                    let element_type_info = &ti.args[0];
+                    if matches!(
+                        element_type_info.kind,
+                        PyTypeKind::Class | PyTypeKind::Union
+                    ) {
+                        debug!("[json_to_python] Coercing single Object into List[Class/Union]. Expected element: {:?}", element_type_info.name);
+                        let wrapped_value = JsonValue::Array(vec![JsonValue::Object(map.clone())]);
+                        return json_to_python(py, &wrapped_value, Some(ti)); // Recurse with original List type_info
+                    }
+                }
+            }
+
             let dict = PyDict::new(py);
 
             // If we have type info for a union, try to determine which type to use

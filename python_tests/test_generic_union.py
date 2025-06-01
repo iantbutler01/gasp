@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test case for generic Union parsing and deserialization."""
 
-from typing import Union
+from typing import Union, List
 from gasp import Parser, Deserializable
 
 class A(Deserializable):
@@ -88,7 +88,46 @@ def test_named_union():
     print(f"Is instance of A? {isinstance(result_a, A)}")
     print()
 
+# Test 4: List of mixed Union items
+def test_list_of_mixed_union_items():
+    print("=== Test 4: List of Mixed Union Items ===")
+    parser = Parser(List[Union[A, B]])
+
+    mixed_list_data = '''
+    <list>[
+        {"_type_name": "A", "name": "First A", "value_a": 123},
+        {"_type_name": "B", "title": "First B", "value_b": 45.67},
+        {"_type_name": "A", "name": "Second A", "value_a": 890}
+    ]</list>
+    '''
+    parser.feed(mixed_list_data)
+    result = parser.validate()
+
+    print(f"Result type: {type(result)}")
+    print(f"Result: {result}")
+
+    assert isinstance(result, list)
+    assert len(result) == 3
+
+    # First item (A)
+    assert isinstance(result[0], A)
+    assert result[0].name == "First A"
+    assert result[0].value_a == 123
+
+    # Second item (B)
+    assert isinstance(result[1], B)
+    assert result[1].title == "First B"
+    assert result[1].value_b == 45.67
+
+    # Third item (A)
+    assert isinstance(result[2], A)
+    assert result[2].name == "Second A"
+    assert result[2].value_a == 890
+    print("List of mixed union items test passed.")
+    print()
+
 if __name__ == "__main__":
     test_generic_union()
     test_generic_union_no_typename()
     test_named_union()
+    test_list_of_mixed_union_items()
