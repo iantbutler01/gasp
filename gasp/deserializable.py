@@ -83,7 +83,7 @@ class Deserializable:
             fields[name] = {"type": type_hint}
         return fields
     
-    def model_dump(self, exclude_none=True):
+    def model_dump(self, exclude_none=True, mode="dict"):
         """Convert model to dict (Pydantic V2 compatible)"""
         result = {}
         for k, v in self.__dict__.items():
@@ -104,7 +104,7 @@ class Deserializable:
                 dumped_list = []
                 for item in v:
                     if isinstance(item, Deserializable):
-                        dumped_item = item.model_dump(exclude_none=exclude_none)
+                        dumped_item = item.model_dump(exclude_none=exclude_none, mode=mode)
                         if not (exclude_none and dumped_item is None):
                             dumped_list.append(dumped_item)
                     else:
@@ -116,7 +116,7 @@ class Deserializable:
                 dumped_dict = {}
                 for dict_k, dict_v in v.items():
                     if isinstance(dict_v, Deserializable):
-                        dumped_item = dict_v.model_dump(exclude_none=exclude_none)
+                        dumped_item = dict_v.model_dump(exclude_none=exclude_none, mode=mode)
                         if not (exclude_none and dumped_item is None):
                             dumped_dict[dict_k] = dumped_item
                     else:
@@ -131,4 +131,4 @@ class Deserializable:
     def model_dump_json(self):
         """Convert model to JSON string (Pydantic V2 compatible)"""
         import json
-        return json.dumps(self.model_dump(), ensure_ascii=False, indent=2)
+        return json.dumps(self.model_dump(mode="json"), ensure_ascii=False, indent=2)

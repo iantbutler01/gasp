@@ -65,6 +65,16 @@ impl Scanner {
         self.lexer.reset_if_done(); // resume at first new byte
     }
 
+    /// If the lexer was in the middle of forming a string, number, or ident token
+    /// (i.e., its state is Str, Num, or Ident), this method resets the lexer's
+    /// internal token buffer (`tok_buf`) and its state to `Value`.
+    /// This is crucial after a `NeedMore` step if the builder has already finalized
+    /// a partial scalar, to prevent subsequent unrelated characters from being appended
+    /// to the lexer's old token buffer.
+    pub fn reset_tok_buf_and_lexer_state_if_mid_scalar(&mut self) {
+        self.lexer.reset_state_if_mid_scalar_token();
+    }
+
     /// Consume *one* meaningful token and turn it into a [`Step`].
     /// Caller may call repeatedly until it gets `NeedMore`.
     pub fn next_step(&mut self) -> Step {

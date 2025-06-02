@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc b2f591be931aa088e385b988dc6acb8a4912bfaa7fafcfb82aae65af00140b96 # shrinks to json = "{\"0\":null}", chunk_sz = 1
+cc b214747a0cc93ecf1e1059fe8fe3c9e058e074b565a1e28a12a87b979ee2eed1 # shrinks to json = "{\"107\":null,\"143\":null,\"29\":null,\"5\":null}", chunk_sz = 23

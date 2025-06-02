@@ -678,8 +678,6 @@ pub fn json_to_python(
                 }
             }
 
-            let dict = PyDict::new(py);
-
             // If we have type info for a union, try to determine which type to use
             if let Some(PyTypeInfo {
                 kind: PyTypeKind::Union,
@@ -746,24 +744,18 @@ pub fn json_to_python(
                     }
                 }
             }
-
-            // Fall back to regular dict
-            for (k, v) in map {
-                let field_type = if let Some(PyTypeInfo {
-                    kind: PyTypeKind::Class,
-                    fields,
-                    ..
-                }) = type_info
-                {
-                    fields.get(k)
-                } else {
-                    None
-                };
-
-                dict.set_item(k, json_to_python(py, v, field_type)?)?;
+            if let Some(ti) = type_info {
+                if ti.kind == PyTypeKind::Class {
+                    // This implies that the PyTypeKind::Class block above did not return early
+                    // with a successfully created instance, or create_instance_from_json returned None,
+                    // and somehow we didn't return py.None() from there.
+                    // This is an explicit final guard.
+                    debug!("[json_to_python] Fallback for JsonValue::Object, but expected kind was Class ('{}'). All instantiation attempts failed. STRICTLY returning None.", ti.name);
+                    return Ok(py.None());
+                }
             }
 
-            Ok(dict.into())
+            Ok(py.None())
         }
         JsonValue::Array(arr) => {
             let list = PyList::empty(py);
@@ -866,90 +858,6 @@ pub fn json_to_python(
 
             Ok(list.into())
         }
-        JsonValue::String(s) => {
-            // If type is enum, try to convert to enum
-            if let Some(PyTypeInfo {
-                kind: PyTypeKind::Class,
-                name,
-                module,
-                py_type,
-                ..
-            }) = type_info
-            {
-                // First try using the stored Python type reference
-                if let Some(py_type_ref) = py_type {
-                    let py_type_obj = py_type_ref.as_ref(py);
-                    // Try to get the enum value
-                    if let Ok(enum_value) = py_type_obj.getattr(s.as_str()) {
-                        return Ok(enum_value.into());
-                    }
-                }
-
-                // Fall back to module-based lookup
-                if let Some(module_name) = module {
-                    if module_name == "enum" {
-                        // Try to get the enum class
-                        if let Ok(py_module) = py.import(module_name.as_str()) {
-                            if let Ok(py_enum) = py_module.getattr(name.as_str()) {
-                                // Try to get the enum value
-                                if let Ok(enum_value) = py_enum.getattr(s.as_str()) {
-                                    return Ok(enum_value.into());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            Ok(s.clone().into_py(py))
-        }
-        JsonValue::Number(n) => match n {
-            Number::Integer(i) => {
-                // Check if we have a type reference to use directly
-                if let Some(PyTypeInfo { py_type, kind, .. }) = type_info {
-                    if let Some(py_type_ref) = py_type {
-                        let py_type_obj = py_type_ref.as_ref(py);
-
-                        // Convert based on the actual Python type
-                        match kind {
-                            PyTypeKind::Float => Ok((*i as f64).into_py(py)),
-                            PyTypeKind::Integer => Ok(i.into_py(py)),
-                            // Try to construct the type with the value
-                            _ => {
-                                if let Ok(result) = py_type_obj.call1((*i,)) {
-                                    return Ok(result.into());
-                                }
-                                // Fall back to default conversion
-                                Ok(i.into_py(py))
-                            }
-                        }
-                    } else if kind == &PyTypeKind::Float {
-                        // Fall back to float conversion if we know it's a float
-                        Ok((*i as f64).into_py(py))
-                    } else {
-                        Ok(i.into_py(py))
-                    }
-                } else {
-                    Ok(i.into_py(py))
-                }
-            }
-            Number::Float(f) => {
-                // Check if we have a type reference to use directly
-                if let Some(PyTypeInfo { py_type, .. }) = type_info {
-                    if let Some(py_type_ref) = py_type {
-                        let py_type_obj = py_type_ref.as_ref(py);
-
-                        // Try to construct the type with the value
-                        if let Ok(result) = py_type_obj.call1((*f,)) {
-                            return Ok(result.into());
-                        }
-                    }
-                }
-                // Fall back to default conversion
-                Ok(f.into_py(py))
-            }
-        },
-        JsonValue::Boolean(b) => Ok(b.into_py(py)),
         JsonValue::Null => Ok(py.None()),
     }
 }
@@ -1033,52 +941,147 @@ pub fn create_instance_from_json(
     }
 
     // First try to use __gasp_from_partial__ method if available
+    let py_type_repr_gasp = py_type.repr()?.extract::<String>()?;
     if let Ok(from_partial) = py_type.getattr("__gasp_from_partial__") {
         if let Ok(instance) = from_partial.call1((partial_data,)) {
+            let type_repr_success = py_type.repr()?.extract::<String>()?;
+            debug!(
+                "[RUST:create_instance_from_json] Success via __gasp_from_partial__ for type: {}",
+                type_repr_success
+            );
             return Ok(instance.into());
+        } else {
+            let type_repr_fail = py_type.repr()?.extract::<String>()?;
+            debug!("[RUST:create_instance_from_json] Call to __gasp_from_partial__ failed for type: {}", type_repr_fail);
         }
+    } else {
+        let type_repr_no_method = py_type.repr()?.extract::<String>()?;
+        debug!(
+            "[RUST:create_instance_from_json] Type {} does not have __gasp_from_partial__.",
+            type_repr_no_method
+        );
     }
 
-    // For non-Deserializable classes, try to instantiate with kwargs
+    // For non-Deserializable classes (or if __gasp_from_partial__ failed), try to instantiate with kwargs
+    let py_type_repr_kwargs = py_type.repr()?.extract::<String>()?;
+    debug!(
+        "[RUST:create_instance_from_json] Attempting kwargs instantiation for type: {}",
+        py_type_repr_kwargs
+    );
     if let Ok(instance) = py_type.call((), Some(partial_data)) {
+        let type_repr_success = py_type.repr()?.extract::<String>()?;
+        debug!(
+            "[RUST:create_instance_from_json] Success via kwargs instantiation for type: {}",
+            type_repr_success
+        );
         return Ok(instance.into());
+    } else {
+        let type_repr_fail = py_type.repr()?.extract::<String>()?;
+        debug!(
+            "[RUST:create_instance_from_json] Kwargs instantiation failed for type: {}",
+            type_repr_fail
+        );
     }
 
-    // Fallback to normal instantiation if __gasp_from_partial__ isn't available
-    if let Ok(instance) = py_type.call0() {
-        // Populate fields manually
-        for (k, v) in map {
-            let field_type = fields.get(k);
-
-            // Process the value with the correct field type information for setting attributes
-            let py_value = match (v, field_type) {
-                // For nested objects, ensure we pass the type info
-                (JsonValue::Object(_), Some(field_info))
-                    if field_info.kind == PyTypeKind::Class =>
-                {
-                    json_to_python(py, v, Some(field_info))?
+    // Fallback to normal instantiation if __gasp_from_partial__ isn't available or kwargs failed
+    let py_type_repr_call0 = py_type.repr()?.extract::<String>()?;
+    debug!(
+        "[RUST:create_instance_from_json] Attempting no-arg instantiation (call0) for type: {}",
+        py_type_repr_call0
+    );
+    if let Ok(instance_obj) = py_type.call0() {
+        let instance = instance_obj;
+        let type_repr_success = py_type.repr()?.extract::<String>()?;
+        debug!(
+            "[RUST:create_instance_from_json] Success via no-arg instantiation for type: {}",
+            type_repr_success
+        );
+        for (key_obj, value_obj) in partial_data.iter() {
+            if let Ok(key_str) = key_obj.extract::<&str>() {
+                if let Err(e) = instance.setattr(key_str, value_obj) {
+                    let err_msg = format!("[RUST:create_instance_from_json] Error setting attribute '{}' on no-arg instance: {:?}", key_str, e);
+                    debug!("{}", err_msg);
                 }
-                // For lists with type info, ensure each element gets proper typing
-                (JsonValue::Array(_), Some(field_info)) if field_info.kind == PyTypeKind::List => {
-                    json_to_python(py, v, Some(field_info))?
-                }
-                // For other types, proceed normally
-                _ => json_to_python(py, v, field_type)?,
-            };
-
-            instance.setattr(k.as_str(), py_value)?;
+            }
         }
         return Ok(instance.into());
+    } else {
+        let type_repr_fail = py_type.repr()?.extract::<String>()?;
+        debug!(
+            "[RUST:create_instance_from_json] No-arg instantiation (call0) failed for type: {}",
+            type_repr_fail
+        );
     }
 
-    // If we couldn't create an instance, fall back to returning a dict
-    let dict = PyDict::new(py);
-    for (k, v) in map {
-        let field_type = fields.get(k);
-        let py_value = json_to_python(py, v, field_type)?;
-        dict.set_item(k, py_value)?;
+    // If standard instantiation failed, but we have a specific class type,
+    // try to create a "bare" instance using __new__ and then populate it.
+    let py_type_repr_new_attempt = py_type.repr()?.extract::<String>()?;
+    debug!("[RUST:create_instance_from_json] Standard instantiation failed for type {}. Attempting bare instance creation via __new__.", py_type_repr_new_attempt);
+    if let Ok(new_method) = py_type.getattr("__new__") {
+        if let Ok(bare_instance_any) = new_method.call1((py_type,)) {
+            let bare_instance = bare_instance_any;
+            let py_type_repr_new_success = py_type.repr()?.extract::<String>()?;
+            debug!("[RUST:create_instance_from_json] Successfully created bare instance via __new__ for type: {}", py_type_repr_new_success);
+
+            // Initialize all known fields to defaults first
+            debug!("[RUST:create_instance_from_json] Initializing default fields for bare instance of type: {}", py_type_repr_new_success);
+            for (field_name, field_type_info) in fields.iter() {
+                let default_value = match field_type_info.kind {
+                    PyTypeKind::String => pyo3::types::PyString::new(py, "").to_object(py),
+                    PyTypeKind::Integer => 0_i32.to_object(py),
+                    PyTypeKind::Float => 0.0_f32.to_object(py),
+                    PyTypeKind::Boolean => false.to_object(py),
+                    PyTypeKind::List | PyTypeKind::Tuple => PyList::empty(py).to_object(py),
+                    PyTypeKind::Dict => PyDict::new(py).to_object(py),
+                    _ => py.None(),
+                };
+                if let Err(e) = bare_instance.setattr(field_name.as_str(), default_value) {
+                    let err_msg = format!("[RUST:create_instance_from_json] Error setting default attribute '{}' on bare instance: {:?}", field_name, e);
+                    debug!("{}", err_msg);
+                }
+            }
+
+            debug!("[RUST:create_instance_from_json] Populating bare instance with partial_data for type: {}", py_type_repr_new_success);
+            for (key_obj, value_obj) in partial_data.iter() {
+                if let Ok(key_str) = key_obj.extract::<&str>() {
+                    if let Err(e) = bare_instance.setattr(key_str, value_obj) {
+                        let err_msg = format!("[RUST:create_instance_from_json] Error setting attribute '{}' from partial_data on bare instance: {:?}", key_str, e);
+                        debug!("{}", err_msg);
+                    }
+                }
+            }
+            let populated_bare_instance_repr = bare_instance.repr()?.extract::<String>()?;
+            debug!(
+                "[RUST:create_instance_from_json] Populated bare instance: {}",
+                populated_bare_instance_repr
+            );
+            return Ok(bare_instance.into());
+        } else {
+            let py_type_repr_new_fail = py_type.repr()?.extract::<String>()?;
+            debug!(
+                "[RUST:create_instance_from_json] Call to __new__ failed for type: {}",
+                py_type_repr_new_fail
+            );
+        }
+    } else {
+        let py_type_repr_no_new = py_type.repr()?.extract::<String>()?;
+        debug!(
+            "[RUST:create_instance_from_json] Type {} does not have __new__ method.",
+            py_type_repr_no_new
+        );
     }
-    Ok(dict.into())
+
+    // Final fallback: if __new__ path also failed.
+    let dict_type_obj = py.get_type::<PyDict>();
+    let is_target_dict_type = py_type.get_type().eq(dict_type_obj)?;
+
+    if !is_target_dict_type {
+        let py_type_repr_final_none = py_type.repr()?.extract::<String>()?;
+        Ok(py.None())
+    } else {
+        let py_type_repr_final_dict = py_type.repr()?.extract::<String>()?;
+        Ok(partial_data.into())
+    }
 }
 
 /// Update an existing Python instance with new JSON data

@@ -1,6 +1,6 @@
 use log::debug;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString};
+use pyo3::types::{PyDict, PyList, PyString}; // Added PyList
 
 use crate::json_parser::StreamParser;
 use crate::json_types::JsonValue;
@@ -47,7 +47,6 @@ impl TypedStreamParser {
     }
 
     pub fn with_type(type_info: PyTypeInfo) -> Self {
-        // let type_info_clone_for_stream_parser = Some(type_info.clone()); // No longer needed for constructor
         Self {
             stream_parser: StreamParser::new(Vec::new(), Vec::new()), // Now takes 2 args
             type_info: Some(type_info), // Store the original type_info
@@ -62,7 +61,7 @@ impl TypedStreamParser {
     /// Process a chunk of JSON data
     pub fn step(&mut self, chunk: &str) -> PyResult<Option<JsonValue>> {
         // Use the stream parser to process the chunk, passing stored type_info
-        let result = match self.stream_parser.step(chunk, self.type_info.as_ref()) {
+        let result = match self.stream_parser.step(chunk) {
             Ok(val) => val,
             Err(e) => {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
@@ -72,17 +71,27 @@ impl TypedStreamParser {
             }
         };
 
-        // If we got a result, update our partial data
+        // If we got a result, this is the new complete state of the partial data.
         if let Some(value) = result.clone() {
-            self.partial_data = Some(match self.partial_data.take() {
-                Some(partial) => self.merge_json_values(partial, value),
-                None => value,
-            });
+            // result is Option<JsonValue> from stream_parser.step
+            self.partial_data = Some(value); // Directly use the new state
 
             // Check if parsing is complete based on stream parser state
             self.is_done = self.stream_parser.is_done();
+        } else if chunk.is_empty() && !self.is_done {
+            // If an empty chunk is fed and we are not done, it might be a signal to finalize
+            // based on existing partial_data. The to_python_object will handle current partial_data.
+            // self.is_done might be set by stream_parser if it finishes on empty chunk.
+            self.is_done = self.stream_parser.is_done();
         }
 
+        // The 'result' from stream_parser.step is Option<JsonValue> representing the latest yield.
+        // We've stored it in self.partial_data.
+        // The PyParser.feed() method will call self.to_python_object() which uses self.partial_data.
+        // So, step itself doesn't need to return the JsonValue, PyParser.feed will get it via to_python_object.
+        // However, the original design returned Option<JsonValue> here, which might be used by some callers
+        // or tests directly if TypedStreamParser is used outside PyParser.
+        // For now, let's keep returning it, though it's somewhat redundant with get_partial().
         Ok(result)
     }
 
@@ -98,100 +107,208 @@ impl TypedStreamParser {
 
     /// Convert current partial data to Python object using type info
     pub fn to_python_object(&mut self, py: Python) -> PyResult<Option<PyObject>> {
-        match &self.partial_data {
+        let result_before_final_coercion: Option<PyObject> = match &self.partial_data {
             Some(data) => {
-                // If it's a Pydantic model, we always just convert the current JSON data to a Python dict.
-                // Pydantic models are expected to return dicts from feed() until validate() is called.
                 if self.is_pydantic_model {
-                    return Ok(Some(json_to_python(py, data, self.type_info.as_ref())?));
-                }
-
-                // For non-Pydantic classes, attempt incremental instance updates.
-                if let (Some(type_info), JsonValue::Object(map)) = (self.type_info.as_ref(), data) {
-                    if type_info.kind == crate::python_types::PyTypeKind::Class {
-                        if let Some(py_type_ref) = &type_info.py_type {
-                            let py_type_obj = py_type_ref.as_ref(py);
-
-                            if let Some(existing_instance) = &self.partial_instance {
-                                // Ensure existing_instance is not a dict before trying to update it like a class instance
-                                if !existing_instance.as_ref(py).is_instance_of::<PyDict>() {
-                                    let instance = crate::python_types::update_instance_from_json(
-                                        py,
-                                        existing_instance.as_ref(py),
-                                        map,
-                                        &type_info.fields,
-                                    )?;
-                                    return Ok(Some(instance));
+                    Some(json_to_python(py, data, self.type_info.as_ref())?)
+                } else if let (Some(type_info_ref_outer), _) = (self.type_info.as_ref(), data) {
+                    // Handle List[Class] case specifically for instance creation/update
+                    if type_info_ref_outer.kind == crate::python_types::PyTypeKind::List
+                        && !type_info_ref_outer.args.is_empty()
+                    {
+                        let element_type_info = &type_info_ref_outer.args[0];
+                        if element_type_info.kind == crate::python_types::PyTypeKind::Class {
+                            if let JsonValue::Object(map) = data {
+                                // Only proceed if data is an object for class instantiation
+                                if let Some(py_type_ref) = &element_type_info.py_type {
+                                    let py_type_obj = py_type_ref.as_ref(py);
+                                    // Try to update existing instance if it's for this element type
+                                    if let Some(existing_instance) = &self.partial_instance {
+                                        if existing_instance.as_ref(py).is_instance(py_type_obj)?
+                                            && !existing_instance
+                                                .as_ref(py)
+                                                .is_instance_of::<PyDict>()
+                                        {
+                                            let updated_instance =
+                                                crate::python_types::update_instance_from_json(
+                                                    py,
+                                                    existing_instance.as_ref(py),
+                                                    map,
+                                                    &element_type_info.fields,
+                                                )?;
+                                            // self.partial_instance remains the same, just updated
+                                            Some(updated_instance)
+                                        } else {
+                                            // Existing instance is not of the correct type, or is a dict. Create new.
+                                            let instance =
+                                                crate::python_types::create_instance_from_json(
+                                                    py,
+                                                    py_type_obj,
+                                                    map,
+                                                    &element_type_info.fields,
+                                                )?;
+                                            if !instance.as_ref(py).is_instance_of::<PyDict>() {
+                                                self.partial_instance =
+                                                    Some(instance.clone_ref(py));
+                                            }
+                                            Some(instance)
+                                        }
+                                    } else {
+                                        // No existing instance, create new
+                                        let instance =
+                                            crate::python_types::create_instance_from_json(
+                                                py,
+                                                py_type_obj,
+                                                map,
+                                                &element_type_info.fields,
+                                            )?;
+                                        if !instance.as_ref(py).is_instance_of::<PyDict>() {
+                                            self.partial_instance = Some(instance.clone_ref(py));
+                                        }
+                                        Some(instance)
+                                    }
                                 } else {
-                                    // existing_instance is a dict, this shouldn't happen if not pydantic
-                                    // Fall through to full conversion from JSON
+                                    // No py_type_ref for element_type_info, fall back to general json_to_python
+                                    Some(json_to_python(py, data, self.type_info.as_ref())?)
+                                }
+                            } else {
+                                // Data is not an object, but List[Class] expected. Let json_to_python handle coercion.
+                                Some(json_to_python(py, data, self.type_info.as_ref())?)
+                            }
+                        } else {
+                            // Not List[Class], e.g. List[Union], List[str], or direct Class/Union etc.
+                            Some(json_to_python(py, data, self.type_info.as_ref())?)
+                        }
+                    }
+                    // Handle direct Class types (not in a List)
+                    else if type_info_ref_outer.kind == crate::python_types::PyTypeKind::Class {
+                        if let JsonValue::Object(map) = data {
+                            if let Some(py_type_ref) = &type_info_ref_outer.py_type {
+                                let py_type_obj = py_type_ref.as_ref(py);
+                                // Try to update existing instance if it's for this type
+                                if let Some(existing_instance) = &self.partial_instance {
+                                    if existing_instance.as_ref(py).is_instance(py_type_obj)?
+                                        && !existing_instance.as_ref(py).is_instance_of::<PyDict>()
+                                    {
+                                        let updated_instance =
+                                            crate::python_types::update_instance_from_json(
+                                                py,
+                                                existing_instance.as_ref(py),
+                                                map,
+                                                &type_info_ref_outer.fields,
+                                            )?;
+                                        Some(updated_instance)
+                                    } else {
+                                        // Create new instance
+                                        let instance =
+                                            crate::python_types::create_instance_from_json(
+                                                py,
+                                                py_type_obj,
+                                                map,
+                                                &type_info_ref_outer.fields,
+                                            )?;
+                                        if !instance.as_ref(py).is_none()
+                                            && !instance.as_ref(py).is_instance_of::<PyDict>()
+                                        {
+                                            self.partial_instance = Some(instance.clone_ref(py));
+                                        }
+                                        Some(instance)
+                                    }
+                                } else {
+                                    // No existing instance, create new
+                                    let instance = crate::python_types::create_instance_from_json(
+                                        py,
+                                        py_type_obj,
+                                        map,
+                                        &type_info_ref_outer.fields,
+                                    )?;
+                                    if !instance.as_ref(py).is_none()
+                                        && !instance.as_ref(py).is_instance_of::<PyDict>()
+                                    {
+                                        self.partial_instance = Some(instance.clone_ref(py));
+                                    }
+                                    Some(instance)
+                                }
+                            } else {
+                                Some(json_to_python(py, data, self.type_info.as_ref())?)
+                            }
+                        } else {
+                            Some(json_to_python(py, data, self.type_info.as_ref())?)
+                        }
+                    }
+                    // Handle Union types - try to create instances for Class types in the union
+                    else if type_info_ref_outer.kind == crate::python_types::PyTypeKind::Union {
+                        if let JsonValue::Object(map) = data {
+                            // Check if any type in the union is a Class that we can instantiate
+                            for union_arg in &type_info_ref_outer.args {
+                                if union_arg.kind == crate::python_types::PyTypeKind::Class {
+                                    if let Some(py_type_ref) = &union_arg.py_type {
+                                        let py_type_obj = py_type_ref.as_ref(py);
+                                        // Try to create instance for this union member
+                                        if let Some(existing_instance) = &self.partial_instance {
+                                            if existing_instance
+                                                .as_ref(py)
+                                                .is_instance(py_type_obj)?
+                                                && !existing_instance
+                                                    .as_ref(py)
+                                                    .is_instance_of::<PyDict>()
+                                            {
+                                                let updated_instance =
+                                                    crate::python_types::update_instance_from_json(
+                                                        py,
+                                                        existing_instance.as_ref(py),
+                                                        map,
+                                                        &union_arg.fields,
+                                                    )?;
+                                                return Ok(Some(updated_instance));
+                                            }
+                                        }
+                                        // Try to create new instance for this union member
+                                        let instance =
+                                            crate::python_types::create_instance_from_json(
+                                                py,
+                                                py_type_obj,
+                                                map,
+                                                &union_arg.fields,
+                                            )?;
+                                        if !instance.as_ref(py).is_none()
+                                            && !instance.as_ref(py).is_instance_of::<PyDict>()
+                                        {
+                                            self.partial_instance = Some(instance.clone_ref(py));
+                                            return Ok(Some(instance));
+                                        }
+                                    }
                                 }
                             }
-                            // No existing non-dict instance, or it was a dict (shouldn't be for non-pydantic)
-                            // Create a new instance from full JSON data
-                            let instance = crate::python_types::create_instance_from_json(
-                                py,
-                                py_type_obj,
-                                map,
-                                &type_info.fields,
-                            )?;
-                            // Only store if it's not a dict (i.e., it's a proper class instance)
-                            if !instance.as_ref(py).is_instance_of::<PyDict>() {
-                                self.partial_instance = Some(instance.clone_ref(py));
-                            }
-                            return Ok(Some(instance));
                         }
+                        // Fall back to general json_to_python for Union types
+                        Some(json_to_python(py, data, self.type_info.as_ref())?)
+                    }
+                    // This case handles other types (List[str], Dict, etc.)
+                    else {
+                        Some(json_to_python(py, data, self.type_info.as_ref())?)
+                    }
+                } else {
+                    // self.type_info is None
+                    Some(json_to_python(py, data, None)?)
+                }
+            }
+            None => None,
+        };
+
+        if let Some(py_obj_candidate) = result_before_final_coercion {
+            if let Some(root_ti) = self.type_info.as_ref() {
+                if root_ti.kind == crate::python_types::PyTypeKind::List {
+                    if !py_obj_candidate.as_ref(py).is_instance_of::<PyList>() {
+                        debug!("[to_python_object] Root type is List, but current object is not a list. Wrapping it.");
+                        let list_wrapper = PyList::new(py, &[py_obj_candidate]);
+                        return Ok(Some(list_wrapper.into()));
                     }
                 }
-                // Default conversion for non-class types or if class instance logic didn't apply
-                Ok(Some(json_to_python(py, data, self.type_info.as_ref())?))
             }
-            None => Ok(None),
-        }
-    }
-
-    /// Merge two JSON values
-    /// This handles incremental updates to the same object
-    fn merge_json_values(&self, existing: JsonValue, new_data: JsonValue) -> JsonValue {
-        match (existing, new_data) {
-            // Merge objects by updating existing fields
-            (JsonValue::Object(mut existing_map), JsonValue::Object(new_map)) => {
-                for (key, value) in new_map {
-                    match existing_map.get(&key) {
-                        Some(existing_value) => {
-                            // Recursively merge if both are objects or arrays
-                            existing_map
-                                .insert(key, self.merge_json_values(existing_value.clone(), value));
-                        }
-                        None => {
-                            // Just add the new value
-                            existing_map.insert(key, value);
-                        }
-                    }
-                }
-                JsonValue::Object(existing_map)
-            }
-
-            // For arrays, append or update elements
-            (JsonValue::Array(mut existing_arr), JsonValue::Array(new_arr)) => {
-                // Extend array if needed
-                if new_arr.len() > existing_arr.len() {
-                    existing_arr.resize_with(new_arr.len(), || JsonValue::Null);
-                }
-
-                // Update elements
-                for (i, value) in new_arr.into_iter().enumerate() {
-                    if i < existing_arr.len() {
-                        existing_arr[i] = self.merge_json_values(existing_arr[i].clone(), value);
-                    } else {
-                        existing_arr.push(value);
-                    }
-                }
-                JsonValue::Array(existing_arr)
-            }
-
-            // For other cases, just use the new value
-            (_, new_value) => new_value,
+            Ok(Some(py_obj_candidate))
+        } else {
+            Ok(None)
         }
     }
 }
@@ -259,22 +376,8 @@ impl PyParser {
                     ignored_tags
                 );
 
-                // Create the stream parser with ignored tags
-                let mut parser = TypedStreamParser::with_type(type_info); // This initializes TypedStreamParser.stream_parser with type_info
+                let mut parser = TypedStreamParser::with_type(type_info);
                 parser.expected_tags = tags.clone();
-                // Configure the existing stream_parser's tags instead of replacing it, or ensure new one gets type_info
-                // For now, let's assume tags are primarily for TagFinder, and StreamParser's type_info is primary for Builder
-                // If tags are meant to re-initialize the StreamParser, it must also get the type_info.
-                // The current TypedStreamParser.with_type already initializes its internal StreamParser with Vec::new() for tags.
-                // We need to update that internal StreamParser if tags change here.
-                // A cleaner way might be for TypedStreamParser::with_type to also take initial tags.
-                // Or, add a method to TypedStreamParser to update tags, which re-initializes its StreamParser.
-
-                // TypedStreamParser.with_type correctly initializes its internal StreamParser.
-                // We now need to ensure the TagFinder within that StreamParser gets the correct tags.
-                // This requires a method to update tags on StreamParser/TagFinder, or for new() to take them.
-                // For now, we re-initialize StreamParser, ensuring it gets the correct number of args.
-                // The type_info is managed by TypedStreamParser and passed via its step method.
                 parser.stream_parser = StreamParser::new(tags, ignored_tags.clone());
 
                 Ok(Self { parser })
@@ -297,59 +400,31 @@ impl PyParser {
     #[staticmethod]
     #[pyo3(text_signature = "(pydantic_model)")]
     fn from_pydantic(py: Python, pydantic_model: &PyAny) -> PyResult<Self> {
-        // Get the model fields
-        let model_fields = if let Ok(fields) = pydantic_model.getattr("model_fields") {
-            fields.downcast::<PyDict>()?
-        } else if let Ok(fields) = pydantic_model.getattr("__fields__") {
-            // Fallback for Pydantic v1
-            fields.downcast::<PyDict>()?
-        } else {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Not a valid Pydantic model",
-            ));
-        };
-
-        // Extract type information
         let mut type_info = PyTypeInfo::extract_from_python(pydantic_model)?;
-
-        // Make sure we store the original Python type reference
         if type_info.py_type.is_none() {
             type_info.py_type = Some(pydantic_model.into_py(py));
         }
 
-        // Get the type name to use as the expected tag
         let original_tag_name = if let Ok(name) = pydantic_model.getattr("__name__") {
             name.extract::<String>()?
         } else {
-            // Use the name from type_info if available, otherwise empty string
             type_info.name.clone()
         };
         let tag_name_lower = original_tag_name.to_lowercase();
-        debug!(
-            "[PyParser::from_pydantic] original_tag_name: '{}', lowercased: '{}'",
-            original_tag_name, tag_name_lower
-        );
 
-        // Create a parser that only looks for this specific tag (lowercase)
         let tags_for_stream_parser = if !tag_name_lower.is_empty() {
             vec![tag_name_lower.clone()]
         } else {
             vec![]
         };
-        debug!(
-            "[PyParser::from_pydantic] tags_for_stream_parser: {:?}",
-            tags_for_stream_parser
-        );
 
         let mut typed_stream_parser = TypedStreamParser::with_type(type_info);
-        // TypedStreamParser.expected_tags can keep original case if needed for other logic,
-        // but StreamParser (and TagFinder) must use lowercase for matching.
         typed_stream_parser.expected_tags = if !original_tag_name.is_empty() {
             vec![original_tag_name]
         } else {
             vec![]
         };
-        typed_stream_parser.is_pydantic_model = true; // Set the flag for Pydantic models
+        typed_stream_parser.is_pydantic_model = true;
 
         let default_ignored_tags = vec![
             "think".to_string(),
@@ -357,13 +432,7 @@ impl PyParser {
             "system".to_string(),
             "thought".to_string(),
         ];
-        debug!(
-            "[PyParser::from_pydantic] default_ignored_tags for StreamParser: {:?}",
-            default_ignored_tags
-        );
 
-        // Similar to PyParser::new logic.
-        // The type_info is managed by TypedStreamParser and passed via its step method.
         typed_stream_parser.stream_parser =
             StreamParser::new(tags_for_stream_parser, default_ignored_tags);
 
@@ -372,33 +441,24 @@ impl PyParser {
         })
     }
 
-    /// Feed a chunk of JSON data and return a partial object if available
     #[pyo3(text_signature = "($self, chunk)")]
     fn feed(&mut self, py: Python, chunk: &str) -> PyResult<Option<PyObject>> {
-        // Process the chunk
         self.parser.step(chunk)?;
-
-        // Convert to Python object if we have data
         self.parser.to_python_object(py)
     }
 
-    /// Check if parsing is complete
     #[pyo3(text_signature = "($self)")]
     fn is_complete(&self) -> bool {
         self.parser.is_done()
     }
 
-    /// Get the current partial object without validation
     #[pyo3(text_signature = "($self)")]
     fn get_partial(&mut self, py: Python) -> PyResult<Option<PyObject>> {
         self.parser.to_python_object(py)
     }
 
-    /// Perform full validation on the completed object
     #[pyo3(text_signature = "($self)")]
     fn validate(&mut self, py: Python) -> PyResult<Option<PyObject>> {
-        // For now, just return the partial object
-        // In future, we'll implement validation against the model
         self.get_partial(py)
     }
 }

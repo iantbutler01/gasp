@@ -91,7 +91,7 @@ impl PyStreamParser {
         // Pass None for root_target_type as PyStreamParser is not type-aware in its Python API
         let step_out = self
             .parser
-            .step(chunk, None) // This call should already be correct from previous attempt.
+            .step(chunk) // This call should already be correct from previous attempt.
             .map_err(|e| PyValueError::new_err(format!("stream error: {:?}", e)))?;
 
         if let Some(val) = step_out {
