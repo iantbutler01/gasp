@@ -12,6 +12,7 @@ enum StackFrame {
         items: Vec<PyObject>,
         item_type: PyTypeInfo,
         depth: usize,
+        implicit: bool,
     },
     Dict {
         tag_name: String,
@@ -207,6 +208,7 @@ impl TypedStreamParser {
                     items: Vec::new(),
                     item_type,
                     depth,
+                    implicit: false,
                 }))
             }
             crate::python_types::PyTypeKind::Dict => {
@@ -362,6 +364,29 @@ impl TypedStreamParser {
             self.stack.len()
         );
 
+        // Coercion logic: if we expect a list but get an inner object type, implicitly wrap it in a list.
+        let type_info_clone = self.type_info.clone();
+        if self.stack.is_empty() {
+            if let Some(type_info) = type_info_clone {
+                if type_info.kind == crate::python_types::PyTypeKind::List {
+                    if let Some(item_type) = type_info.args.get(0) {
+                        if item_type.name == *tag_name
+                            && item_type.kind != crate::python_types::PyTypeKind::List
+                        {
+                            // Implicitly create the list frame
+                            self.stack.push(StackFrame::List {
+                                tag_name: "list".to_string(),
+                                items: Vec::new(),
+                                item_type: item_type.clone(),
+                                depth: tag.depth - 1,
+                                implicit: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Debug: print current stack state
         for (i, frame) in self.stack.iter().enumerate() {
             match frame {
@@ -438,7 +463,9 @@ impl TypedStreamParser {
                         None
                     }
                 }
-                StackFrame::List { item_type, .. } if tag_name == "item" => {
+                StackFrame::List { item_type, .. }
+                    if tag_name == "item" || item_type.name == *tag_name =>
+                {
                     // Check if the item_type is a Union and if so, use the type attribute
                     let item_type = if item_type.kind == crate::python_types::PyTypeKind::Optional {
                         // Convert Optional[T] to Union[T, None]
@@ -764,6 +791,19 @@ impl TypedStreamParser {
             }
         }
 
+        // If we just closed an item and the stack now contains only a single, implicitly created list frame,
+        // it implies that the list is done.
+        if self.stack.len() == 1 {
+            if let Some(StackFrame::List { implicit, .. }) = self.stack.last() {
+                if *implicit {
+                    let frame = self.stack.pop().unwrap();
+                    let obj = self.frame_to_pyobject(frame)?;
+                    self.stack_based_result = Some(obj);
+                    self.is_done = true;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -917,31 +957,32 @@ impl PyParser {
                     type_info.py_type = Some(obj.into_py(py));
                 }
 
-                let wanted_tags = match type_info.kind {
-                    crate::python_types::PyTypeKind::Union => {
-                        // For unions, collect all member type names
-                        let mut tags: Vec<String> =
-                            type_info.args.iter().map(|arg| arg.name.clone()).collect();
-                        tags.push(type_info.name.clone());
+                let mut wanted_tags = vec![type_info.name.clone()];
+                let mut types_to_check = vec![type_info.clone()];
 
-                        // Also add lowercase versions to handle case-insensitive matching
-                        let lowercase_tags: Vec<String> =
-                            tags.iter().map(|s| s.to_lowercase()).collect();
-                        tags.extend(lowercase_tags);
-                        tags.sort();
-                        tags.dedup();
-                        tags
-                    }
-                    _ => {
-                        // For non-union types, include both original and lowercase versions
-                        let mut tags = vec![type_info.name.clone()];
-                        let lowercase = type_info.name.to_lowercase();
-                        if lowercase != type_info.name {
-                            tags.push(lowercase);
+                while let Some(current_type) = types_to_check.pop() {
+                    match current_type.kind {
+                        crate::python_types::PyTypeKind::List
+                        | crate::python_types::PyTypeKind::Set
+                        | crate::python_types::PyTypeKind::Tuple
+                        | crate::python_types::PyTypeKind::Union => {
+                            for arg in &current_type.args {
+                                if !wanted_tags.contains(&arg.name) {
+                                    wanted_tags.push(arg.name.clone());
+                                    types_to_check.push(arg.clone());
+                                }
+                            }
                         }
-                        tags
+                        _ => {}
                     }
-                };
+                }
+
+                // Also add lowercase versions to handle case-insensitive matching
+                let lowercase_tags: Vec<String> =
+                    wanted_tags.iter().map(|s| s.to_lowercase()).collect();
+                wanted_tags.extend(lowercase_tags);
+                wanted_tags.sort();
+                wanted_tags.dedup();
                 debug!("[PyParser::new] wanted_tags: {:?}", wanted_tags);
                 let parser = TypedStreamParser::with_type(type_info, wanted_tags, ignored_tags);
                 Ok(Self {
