@@ -3,7 +3,7 @@
 
 import pytest
 from gasp import Parser, Deserializable
-from typing import List
+from typing import List, Union
 
 
 class Person(Deserializable):
@@ -26,6 +26,10 @@ class Person(Deserializable):
         )
 
 
+class Thing2(Deserializable):
+    some_field: str
+
+
 def test_single_element_coercion_to_list():
     """Test that a single emitted element is coerced to a list."""
     parser = Parser(List[Person])
@@ -45,6 +49,28 @@ def test_single_element_coercion_to_list():
     assert parser.is_complete()
 
     expected_person = Person(name="Alice", age=30, email="alice@example.com")
+    assert result[0] == expected_person
+
+
+def test_list_union_coercion():
+    """Test that a single emitted element is coerced to a list in a union."""
+    parser = Parser(List[Union[Person, Thing2]])
+
+    xml_data = """<Person>
+        <name type="str">Bob</name>
+        <age type="int">25</age>
+        <email type="str">bob@example.com</email>
+    </Person>"""
+
+    parser.feed(xml_data)
+    result = parser.validate()
+
+    assert result is not None
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert parser.is_complete()
+
+    expected_person = Person(name="Bob", age=25, email="bob@example.com")
     assert result[0] == expected_person
 
 

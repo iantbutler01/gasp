@@ -370,9 +370,27 @@ impl TypedStreamParser {
             if let Some(type_info) = type_info_clone {
                 if type_info.kind == crate::python_types::PyTypeKind::List {
                     if let Some(item_type) = type_info.args.get(0) {
-                        if item_type.name == *tag_name
-                            && item_type.kind != crate::python_types::PyTypeKind::List
-                        {
+                        // Check if the tag name matches a type that should be in the list
+                        let should_create_implicit_list = match &item_type.kind {
+                            crate::python_types::PyTypeKind::Union => {
+                                // For Union types, check if the tag matches any union member
+                                item_type.args.iter().any(|t| &t.name == tag_name)
+                            }
+                            crate::python_types::PyTypeKind::List => {
+                                // Can't disambiguate if this is the inner or outer list, so don't allow
+                                false
+                            }
+                            _ => {
+                                // For non-union types, check if the tag matches the expected item type
+                                &item_type.name == tag_name
+                            }
+                        };
+
+                        if should_create_implicit_list {
+                            debug!(
+                                "Implicitly creating list frame for type: {} with item type: {}",
+                                type_info.name, item_type.name
+                            );
                             // Implicitly create the list frame
                             self.stack.push(StackFrame::List {
                                 tag_name: "list".to_string(),
@@ -463,49 +481,72 @@ impl TypedStreamParser {
                         None
                     }
                 }
-                StackFrame::List { item_type, .. }
-                    if tag_name == "item" || item_type.name == *tag_name =>
-                {
-                    // Check if the item_type is a Union and if so, use the type attribute
-                    let item_type = if item_type.kind == crate::python_types::PyTypeKind::Optional {
-                        // Convert Optional[T] to Union[T, None]
-                        let inner_type = item_type
-                            .args
-                            .get(0)
-                            .cloned()
-                            .unwrap_or_else(|| PyTypeInfo::any());
-                        let none_type = PyTypeInfo::new(
-                            crate::python_types::PyTypeKind::None,
-                            "None".to_string(),
-                        )
-                        .with_module("builtins".to_string());
-
-                        PyTypeInfo::new(crate::python_types::PyTypeKind::Union, "Union".to_string())
-                            .with_module("typing".to_string())
-                            .with_args(vec![inner_type, none_type])
+                StackFrame::List { item_type, .. } => {
+                    // For lists, we need to check if the tag matches the expected item type
+                    let matches_list_item = if tag_name == "item" {
+                        true
+                    } else if item_type.kind == crate::python_types::PyTypeKind::Union {
+                        // For Union types, check if tag matches any union member
+                        item_type.args.iter().any(|t| &t.name == tag_name)
                     } else {
-                        item_type.clone()
+                        // For non-union types, check direct match
+                        &item_type.name == tag_name
                     };
 
-                    if item_type.kind == crate::python_types::PyTypeKind::Union {
-                        if let Some(type_attr) = tag.attributes.get("type") {
-                            item_type
-                                .args
-                                .iter()
-                                .find(|t| {
-                                    let tattr = type_attr.as_str();
-                                    &t.name == tattr
-                                        || (t.name == "None"
-                                            && (tattr == "None" || tattr == "NoneType"))
-                                        || tattr.starts_with(&t.name)
-                                        || t.name.starts_with(tattr)
-                                })
-                                .cloned()
+                    if matches_list_item {
+                        // Check if the item_type is a Union and if so, use the type attribute
+                        let item_type =
+                            if item_type.kind == crate::python_types::PyTypeKind::Optional {
+                                // Convert Optional[T] to Union[T, None]
+                                let inner_type = item_type
+                                    .args
+                                    .get(0)
+                                    .cloned()
+                                    .unwrap_or_else(|| PyTypeInfo::any());
+                                let none_type = PyTypeInfo::new(
+                                    crate::python_types::PyTypeKind::None,
+                                    "None".to_string(),
+                                )
+                                .with_module("builtins".to_string());
+
+                                PyTypeInfo::new(
+                                    crate::python_types::PyTypeKind::Union,
+                                    "Union".to_string(),
+                                )
+                                .with_module("typing".to_string())
+                                .with_args(vec![inner_type, none_type])
+                            } else {
+                                item_type.clone()
+                            };
+
+                        if item_type.kind == crate::python_types::PyTypeKind::Union {
+                            if let Some(type_attr) = tag.attributes.get("type") {
+                                item_type
+                                    .args
+                                    .iter()
+                                    .find(|t| {
+                                        let tattr = type_attr.as_str();
+                                        &t.name == tattr
+                                            || (t.name == "None"
+                                                && (tattr == "None" || tattr == "NoneType"))
+                                            || tattr.starts_with(&t.name)
+                                            || t.name.starts_with(tattr)
+                                    })
+                                    .cloned()
+                            } else {
+                                // If no type attribute, try to match by tag name
+                                item_type
+                                    .args
+                                    .iter()
+                                    .find(|t| &t.name == tag_name)
+                                    .cloned()
+                                    .or(Some(item_type))
+                            }
                         } else {
                             Some(item_type.clone())
                         }
                     } else {
-                        Some(item_type.clone())
+                        None
                     }
                 }
                 StackFrame::Set { item_type, .. } if tag_name == "item" => {
