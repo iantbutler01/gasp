@@ -264,7 +264,7 @@ def _format_class_type(
                     item_format = f'<item key="example_key" type="{value_type_name}">{value_example}</item>'
                 field_format = f'{comment}<{field_name} type="{type_attr}">\n        {item_format}\n        ...\n    </{field_name}>'
             else:
-                field_format = f'{comment}<{field_name} type="dict">\n        <item key="key">value</item>\n        ...\n    </{field_name}>'
+                field_format = f'{comment}<{field_name} type="{type_attr}">\n        <item key="key">value</item>\n        ...\n    </{field_name}>'
         elif origin is Union:
             # Optional fields
             args = get_args(field_type)
@@ -325,6 +325,17 @@ def _format_class_type(
                     structure_examples[item_class_name] = (
                         _generate_class_structure_example(item_type, structure_examples)
                     )
+        elif origin is tuple or origin is typing.Tuple:
+            args = get_args(field_type)
+            for item_type in args:
+                if _is_class_type(item_type):
+                    item_class_name = getattr(item_type, "__name__", "Object")
+                    if item_class_name not in structure_examples:
+                        structure_examples[item_class_name] = (
+                            _generate_class_structure_example(
+                                item_type, structure_examples
+                            )
+                        )
         elif origin is dict:
             args = get_args(field_type)
             if len(args) == 2 and _is_class_type(args[1]):
@@ -479,7 +490,7 @@ def _generate_class_structure_example(
                     item_format = f'<item key="example_key" type="{value_type_name}">{value_example}</item>'
                 field_format = f'    <{field_name} type="{type_attr}">\n        {item_format}\n        ...\n    </{field_name}>'
             else:
-                field_format = f'    <{field_name} type="dict">\n        <item key="key">value</item>\n        ...\n    </{field_name}>'
+                field_format = f'    <{field_name} type="{type_attr}">\n        <item key="key">value</item>\n        ...\n    </{field_name}>'
 
         # Handle optional fields
         elif origin is Union:

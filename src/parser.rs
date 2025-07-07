@@ -365,6 +365,7 @@ impl TypedStreamParser {
         );
 
         // Coercion logic: if we expect a list but get an inner object type, implicitly wrap it in a list.
+        // N.B. This is only for top level tags, not nested ones.
         let type_info_clone = self.type_info.clone();
         if self.stack.is_empty() {
             if let Some(type_info) = type_info_clone {
