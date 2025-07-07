@@ -12,6 +12,7 @@ enum StackFrame {
         items: Vec<PyObject>,
         item_type: PyTypeInfo,
         depth: usize,
+        implicit: bool,
     },
     Dict {
         tag_name: String,
@@ -207,6 +208,7 @@ impl TypedStreamParser {
                     items: Vec::new(),
                     item_type,
                     depth,
+                    implicit: false,
                 }))
             }
             crate::python_types::PyTypeKind::Dict => {
@@ -362,6 +364,48 @@ impl TypedStreamParser {
             self.stack.len()
         );
 
+        // Coercion logic: if we expect a list but get an inner object type, implicitly wrap it in a list.
+        // N.B. This is only for top level tags, not nested ones.
+        let type_info_clone = self.type_info.clone();
+        if self.stack.is_empty() {
+            if let Some(type_info) = type_info_clone {
+                if type_info.kind == crate::python_types::PyTypeKind::List {
+                    if let Some(item_type) = type_info.args.get(0) {
+                        // Check if the tag name matches a type that should be in the list
+                        let should_create_implicit_list = match &item_type.kind {
+                            crate::python_types::PyTypeKind::Union => {
+                                // For Union types, check if the tag matches any union member
+                                item_type.args.iter().any(|t| &t.name == tag_name)
+                            }
+                            crate::python_types::PyTypeKind::List => {
+                                // Can't disambiguate if this is the inner or outer list, so don't allow
+                                false
+                            }
+                            _ => {
+                                // For non-union types, check if the tag matches the expected item type
+                                &item_type.name == tag_name
+                            }
+                        };
+
+                        if should_create_implicit_list {
+                            debug!(
+                                "Implicitly creating list frame for type: {} with item type: {}",
+                                type_info.name, item_type.name
+                            );
+                            // Implicitly create the list frame
+                            self.stack.push(StackFrame::List {
+                                tag_name: "list".to_string(),
+                                items: Vec::new(),
+                                item_type: item_type.clone(),
+                                depth: tag.depth - 1,
+                                implicit: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Debug: print current stack state
         for (i, frame) in self.stack.iter().enumerate() {
             match frame {
@@ -438,47 +482,72 @@ impl TypedStreamParser {
                         None
                     }
                 }
-                StackFrame::List { item_type, .. } if tag_name == "item" => {
-                    // Check if the item_type is a Union and if so, use the type attribute
-                    let item_type = if item_type.kind == crate::python_types::PyTypeKind::Optional {
-                        // Convert Optional[T] to Union[T, None]
-                        let inner_type = item_type
-                            .args
-                            .get(0)
-                            .cloned()
-                            .unwrap_or_else(|| PyTypeInfo::any());
-                        let none_type = PyTypeInfo::new(
-                            crate::python_types::PyTypeKind::None,
-                            "None".to_string(),
-                        )
-                        .with_module("builtins".to_string());
-
-                        PyTypeInfo::new(crate::python_types::PyTypeKind::Union, "Union".to_string())
-                            .with_module("typing".to_string())
-                            .with_args(vec![inner_type, none_type])
+                StackFrame::List { item_type, .. } => {
+                    // For lists, we need to check if the tag matches the expected item type
+                    let matches_list_item = if tag_name == "item" {
+                        true
+                    } else if item_type.kind == crate::python_types::PyTypeKind::Union {
+                        // For Union types, check if tag matches any union member
+                        item_type.args.iter().any(|t| &t.name == tag_name)
                     } else {
-                        item_type.clone()
+                        // For non-union types, check direct match
+                        &item_type.name == tag_name
                     };
 
-                    if item_type.kind == crate::python_types::PyTypeKind::Union {
-                        if let Some(type_attr) = tag.attributes.get("type") {
-                            item_type
-                                .args
-                                .iter()
-                                .find(|t| {
-                                    let tattr = type_attr.as_str();
-                                    &t.name == tattr
-                                        || (t.name == "None"
-                                            && (tattr == "None" || tattr == "NoneType"))
-                                        || tattr.starts_with(&t.name)
-                                        || t.name.starts_with(tattr)
-                                })
-                                .cloned()
+                    if matches_list_item {
+                        // Check if the item_type is a Union and if so, use the type attribute
+                        let item_type =
+                            if item_type.kind == crate::python_types::PyTypeKind::Optional {
+                                // Convert Optional[T] to Union[T, None]
+                                let inner_type = item_type
+                                    .args
+                                    .get(0)
+                                    .cloned()
+                                    .unwrap_or_else(|| PyTypeInfo::any());
+                                let none_type = PyTypeInfo::new(
+                                    crate::python_types::PyTypeKind::None,
+                                    "None".to_string(),
+                                )
+                                .with_module("builtins".to_string());
+
+                                PyTypeInfo::new(
+                                    crate::python_types::PyTypeKind::Union,
+                                    "Union".to_string(),
+                                )
+                                .with_module("typing".to_string())
+                                .with_args(vec![inner_type, none_type])
+                            } else {
+                                item_type.clone()
+                            };
+
+                        if item_type.kind == crate::python_types::PyTypeKind::Union {
+                            if let Some(type_attr) = tag.attributes.get("type") {
+                                item_type
+                                    .args
+                                    .iter()
+                                    .find(|t| {
+                                        let tattr = type_attr.as_str();
+                                        &t.name == tattr
+                                            || (t.name == "None"
+                                                && (tattr == "None" || tattr == "NoneType"))
+                                            || tattr.starts_with(&t.name)
+                                            || t.name.starts_with(tattr)
+                                    })
+                                    .cloned()
+                            } else {
+                                // If no type attribute, try to match by tag name
+                                item_type
+                                    .args
+                                    .iter()
+                                    .find(|t| &t.name == tag_name)
+                                    .cloned()
+                                    .or(Some(item_type))
+                            }
                         } else {
                             Some(item_type.clone())
                         }
                     } else {
-                        Some(item_type.clone())
+                        None
                     }
                 }
                 StackFrame::Set { item_type, .. } if tag_name == "item" => {
@@ -764,6 +833,19 @@ impl TypedStreamParser {
             }
         }
 
+        // If we just closed an item and the stack now contains only a single, implicitly created list frame,
+        // it implies that the list is done.
+        if self.stack.len() == 1 {
+            if let Some(StackFrame::List { implicit, .. }) = self.stack.last() {
+                if *implicit {
+                    let frame = self.stack.pop().unwrap();
+                    let obj = self.frame_to_pyobject(frame)?;
+                    self.stack_based_result = Some(obj);
+                    self.is_done = true;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -917,31 +999,32 @@ impl PyParser {
                     type_info.py_type = Some(obj.into_py(py));
                 }
 
-                let wanted_tags = match type_info.kind {
-                    crate::python_types::PyTypeKind::Union => {
-                        // For unions, collect all member type names
-                        let mut tags: Vec<String> =
-                            type_info.args.iter().map(|arg| arg.name.clone()).collect();
-                        tags.push(type_info.name.clone());
+                let mut wanted_tags = vec![type_info.name.clone()];
+                let mut types_to_check = vec![type_info.clone()];
 
-                        // Also add lowercase versions to handle case-insensitive matching
-                        let lowercase_tags: Vec<String> =
-                            tags.iter().map(|s| s.to_lowercase()).collect();
-                        tags.extend(lowercase_tags);
-                        tags.sort();
-                        tags.dedup();
-                        tags
-                    }
-                    _ => {
-                        // For non-union types, include both original and lowercase versions
-                        let mut tags = vec![type_info.name.clone()];
-                        let lowercase = type_info.name.to_lowercase();
-                        if lowercase != type_info.name {
-                            tags.push(lowercase);
+                while let Some(current_type) = types_to_check.pop() {
+                    match current_type.kind {
+                        crate::python_types::PyTypeKind::List
+                        | crate::python_types::PyTypeKind::Set
+                        | crate::python_types::PyTypeKind::Tuple
+                        | crate::python_types::PyTypeKind::Union => {
+                            for arg in &current_type.args {
+                                if !wanted_tags.contains(&arg.name) {
+                                    wanted_tags.push(arg.name.clone());
+                                    types_to_check.push(arg.clone());
+                                }
+                            }
                         }
-                        tags
+                        _ => {}
                     }
-                };
+                }
+
+                // Also add lowercase versions to handle case-insensitive matching
+                let lowercase_tags: Vec<String> =
+                    wanted_tags.iter().map(|s| s.to_lowercase()).collect();
+                wanted_tags.extend(lowercase_tags);
+                wanted_tags.sort();
+                wanted_tags.dedup();
                 debug!("[PyParser::new] wanted_tags: {:?}", wanted_tags);
                 let parser = TypedStreamParser::with_type(type_info, wanted_tags, ignored_tags);
                 Ok(Self {
